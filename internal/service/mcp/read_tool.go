@@ -199,7 +199,7 @@ func (svc *Service) readToolImpl(ctx context.Context, input readInput) (*mcpsdk.
 	case readTargetDAGs:
 		if err = svc.requireAPI(); err == nil {
 			var raw any
-			raw, err = svc.api.GetDAGsListData(ctx, input.Query)
+			raw, err = svc.api.GetDAGsListDataIncludingAltDirs(ctx, input.Query)
 			if err == nil {
 				data, err = normalizeDAGList(raw)
 			}

@@ -1983,76 +1983,109 @@ func (a *API) GetDAGHistoryData(ctx context.Context, fileName string) (any, erro
 // GetDAGsListData returns DAGs list for SSE.
 // Identifier format: URL query string (e.g., "page=1&perPage=100&name=mydag")
 func (a *API) GetDAGsListData(ctx context.Context, queryString string) (any, error) {
+	return a.getDAGsListData(ctx, queryString, false)
+}
+
+// GetDAGsListDataIncludingAltDirs is like GetDAGsListData but the returned list
+// also includes DAGs found under paths.alt_dags_dir. Query semantics are applied
+// to the combined collection.
+func (a *API) GetDAGsListDataIncludingAltDirs(ctx context.Context, queryString string) (any, error) {
+	return a.getDAGsListData(ctx, queryString, true)
+}
+
+func (a *API) getDAGsListData(ctx context.Context, queryString string, includeSearchPaths bool) (any, error) {
 	return withDAGRunReadTimeout(ctx, dagRunReadRequestInfo{
 		endpoint: "/dags",
 	}, func(readCtx context.Context) (any, error) {
-		params, err := url.ParseQuery(queryString)
-		if err != nil {
-			logger.Warn(readCtx, "Failed to parse query string for DAGs list",
-				tag.Error(err),
-				slog.String("queryString", queryString),
-			)
-		}
-
-		page := parseIntParam(params.Get("page"), 1)
-		perPage := parseIntParam(params.Get("perPage"), 100)
-
-		sortField := a.config.UI.DAGs.SortField
-		if sortField == "" {
-			sortField = "name"
-		}
-		if rawSort := params.Get("sort"); rawSort != "" {
-			sortField = rawSort
-		}
-		sortOrder := a.config.UI.DAGs.SortOrder
-		if sortOrder == "" {
-			sortOrder = "asc"
-		}
-		if rawOrder := params.Get("order"); rawOrder != "" {
-			sortOrder = rawOrder
-		}
-
-		var labelsParam, deprecatedTagsParam *string
-		if rawLabels := params.Get("labels"); rawLabels != "" {
-			labelsParam = &rawLabels
-		}
-		if rawTags := params.Get("tags"); rawTags != "" {
-			deprecatedTagsParam = &rawTags
-		}
-		labelQueryParam, labelErr := queryLabelsParam(labelsParam, deprecatedTagsParam)
-		if labelErr != nil {
-			return nil, labelErr
-		}
-		labels := parseCommaSeparatedLabels(labelQueryParam)
-
-		pg := pagination.NewPaginator(page, perPage)
-		workspaceParam := workspaceParamFromValues(params)
-		workspaceFilter, err := a.workspaceFilterForParams(readCtx, workspaceParam)
+		listOpts, err := a.buildDAGListOptions(readCtx, queryString)
 		if err != nil {
 			return nil, err
 		}
-		listOpts := persis.DAGListOptions{
-			Paginator:       &pg,
-			Name:            params.Get("name"),
-			Labels:          labels,
-			ActiveOnly:      params.Get("active") == "true",
-			Sort:            sortField,
-			Order:           sortOrder,
-			WorkspaceFilter: workspaceFilter,
-		}
-
-		return a.listDAGsData(readCtx, listOpts)
+		return a.listDAGsDataWithSearchPaths(readCtx, listOpts, includeSearchPaths)
 	})
 }
 
+func (a *API) buildDAGListOptions(ctx context.Context, queryString string) (persis.DAGListOptions, error) {
+	params, err := url.ParseQuery(queryString)
+	if err != nil {
+		logger.Warn(ctx, "Failed to parse query string for DAGs list",
+			tag.Error(err),
+			slog.String("queryString", queryString),
+		)
+	}
+
+	page := parseIntParam(params.Get("page"), 1)
+	perPage := parseIntParam(params.Get("perPage"), 100)
+
+	sortField := a.config.UI.DAGs.SortField
+	if sortField == "" {
+		sortField = "name"
+	}
+	if rawSort := params.Get("sort"); rawSort != "" {
+		sortField = rawSort
+	}
+	sortOrder := a.config.UI.DAGs.SortOrder
+	if sortOrder == "" {
+		sortOrder = "asc"
+	}
+	if rawOrder := params.Get("order"); rawOrder != "" {
+		sortOrder = rawOrder
+	}
+
+	var labelsParam, deprecatedTagsParam *string
+	if rawLabels := params.Get("labels"); rawLabels != "" {
+		labelsParam = &rawLabels
+	}
+	if rawTags := params.Get("tags"); rawTags != "" {
+		deprecatedTagsParam = &rawTags
+	}
+	labelQueryParam, labelErr := queryLabelsParam(labelsParam, deprecatedTagsParam)
+	if labelErr != nil {
+		return persis.DAGListOptions{}, labelErr
+	}
+	labels := parseCommaSeparatedLabels(labelQueryParam)
+
+	pg := pagination.NewPaginator(page, perPage)
+	workspaceParam := workspaceParamFromValues(params)
+	workspaceFilter, err := a.workspaceFilterForParams(ctx, workspaceParam)
+	if err != nil {
+		return persis.DAGListOptions{}, err
+	}
+	return persis.DAGListOptions{
+		Paginator:       &pg,
+		Name:            params.Get("name"),
+		Labels:          labels,
+		ActiveOnly:      params.Get("active") == "true",
+		Sort:            sortField,
+		Order:           sortOrder,
+		WorkspaceFilter: workspaceFilter,
+	}, nil
+}
+
 func (a *API) listDAGsData(ctx context.Context, listOpts persis.DAGListOptions) (api.ListDAGs200JSONResponse, error) {
+	return a.listDAGsDataWithSearchPaths(ctx, listOpts, false)
+}
+
+// listDAGsDataWithSearchPaths lists DAGs and, when includeSearchPaths is true,
+// also includes DAGs found under the configured alternate directory
+// (paths.alt_dags_dir). Query semantics are applied to the combined collection.
+func (a *API) listDAGsDataWithSearchPaths(ctx context.Context, listOpts persis.DAGListOptions, includeSearchPaths bool) (api.ListDAGs200JSONResponse, error) {
 	projectionTime := time.Now()
 	nextRunProjection := a.nextRunProjection(ctx)
 
 	listOpts.Time = &projectionTime
 	listOpts.NextRunProjection = nextRunProjection
 
-	result, errList, err := a.dagRepository.List(ctx, listOpts)
+	var (
+		result  pagination.PaginatedResult[persis.DAGListItem]
+		errList []string
+		err     error
+	)
+	if includeSearchPaths {
+		result, errList, err = a.dagRepository.ListIncludingSearchPaths(ctx, listOpts)
+	} else {
+		result, errList, err = a.dagRepository.List(ctx, listOpts)
+	}
 	if err != nil {
 		return api.ListDAGs200JSONResponse{}, fmt.Errorf("error listing DAGs: %w", err)
 	}
