@@ -49,16 +49,12 @@ const failedStdoutTailLimit = 1024
 
 type providerConfig struct {
 	name       string
-	provider   Provider
+	provider   *providerDescriptor
 	definition *ir.HarnessDefinition
 	flags      map[string]any
 	managed    bool
 	required   bool
 	modeReason string
-}
-
-type defaultConfigProvider interface {
-	DefaultConfig() map[string]any
 }
 
 type harnessExecutor struct {
@@ -1045,16 +1041,6 @@ func resolveProvider(cfg map[string]any, defs ir.HarnessDefinitions) (providerCo
 	if isTemplatedValue(providerName) {
 		return providerConfig{}, fmt.Errorf("harness: unresolved provider template %q", providerName)
 	}
-	if ir.IsBuiltinCLIHarnessProvider(providerName) {
-		provider, err := getProvider(providerName)
-		if err != nil {
-			return providerConfig{}, err
-		}
-		return providerConfig{
-			name:     provider.Name(),
-			provider: provider,
-		}, nil
-	}
 	if defs != nil {
 		if def, ok := defs[providerName]; ok && def != nil {
 			return providerConfig{
@@ -1063,19 +1049,25 @@ func resolveProvider(cfg map[string]any, defs ir.HarnessDefinitions) (providerCo
 			}, nil
 		}
 	}
+	if ir.IsBuiltinCLIHarnessProvider(providerName) {
+		provider, err := getProvider(providerName)
+		if err != nil {
+			return providerConfig{}, err
+		}
+		return providerConfig{
+			name:     provider.name,
+			provider: provider,
+		}, nil
+	}
 	return providerConfig{}, fmt.Errorf("harness: unknown provider %q; registered: %v", providerName, knownProviders(defs))
 }
 
-func mergeProviderDefaultConfig(provider Provider, cfg map[string]any) map[string]any {
+func mergeProviderDefaultConfig(provider *providerDescriptor, cfg map[string]any) map[string]any {
 	merged := cloneConfigMap(cfg)
 	if provider == nil {
 		return merged
 	}
-	defaultProvider, ok := provider.(defaultConfigProvider)
-	if !ok {
-		return merged
-	}
-	defaults := defaultProvider.DefaultConfig()
+	defaults := maps.Clone(provider.defaultConfig)
 	if len(defaults) == 0 {
 		return merged
 	}
@@ -1278,7 +1270,7 @@ func validateProviderConfig(cfg map[string]any, allowFallback bool) error {
 
 func (cfg providerConfig) binaryName() string {
 	if cfg.provider != nil {
-		return cfg.provider.BinaryName()
+		return cfg.provider.binary
 	}
 	if cfg.definition != nil {
 		return cfg.definition.Binary
@@ -1288,13 +1280,7 @@ func (cfg providerConfig) binaryName() string {
 
 func (cfg providerConfig) buildInvocation(prompt, script string) ([]string, io.Reader, error) {
 	if cfg.provider != nil {
-		args := cfg.provider.BaseArgs(prompt)
-		args = append(args, configToFlags(cfg.flags, nil)...)
-
-		if script == "" {
-			return args, nil, nil
-		}
-		return args, strings.NewReader(script), nil
+		return cfg.provider.buildInvocation(cfg.flags, prompt, script)
 	}
 
 	if cfg.definition == nil {
@@ -1366,11 +1352,18 @@ func promptAndScript(prompt, script string) string {
 }
 
 func knownProviders(defs ir.HarnessDefinitions) []string {
-	names := ir.BuiltinCLIHarnessProviderNames()
+	known := make(map[string]struct{})
+	for _, name := range ir.BuiltinCLIHarnessProviderNames() {
+		known[name] = struct{}{}
+	}
 	for name, def := range defs {
 		if def == nil {
 			continue
 		}
+		known[name] = struct{}{}
+	}
+	names := make([]string, 0, len(known))
+	for name := range known {
 		names = append(names, name)
 	}
 	sort.Strings(names)
