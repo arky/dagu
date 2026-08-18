@@ -17,13 +17,6 @@ function FeedbackTriggers({ messages }: { messages: string[] }) {
   ));
 }
 
-function SuccessTrigger() {
-  const { onSuccess } = useSWRConfig();
-  const reportSuccess = onSuccess as unknown as () => void;
-
-  return <button onClick={reportSuccess}>Succeed</button>;
-}
-
 function renderFeedback(messages: string[]) {
   render(
     <QueryFeedback>
@@ -105,40 +98,5 @@ describe('QueryFeedback', () => {
     expect(screen.getByText('second')).toBeInTheDocument();
     expect(screen.getByText('third')).toBeInTheDocument();
     expect(screen.getByText('fourth')).toBeInTheDocument();
-  });
-
-  it('tracks browser connectivity changes', () => {
-    renderFeedback([]);
-    expect(
-      screen.queryByText('You are offline — data may be stale')
-    ).not.toBeInTheDocument();
-
-    act(() => window.dispatchEvent(new Event('offline')));
-    expect(
-      screen.getByText('You are offline — data may be stale')
-    ).toBeInTheDocument();
-
-    act(() => window.dispatchEvent(new Event('online')));
-    expect(
-      screen.queryByText('You are offline — data may be stale')
-    ).not.toBeInTheDocument();
-  });
-
-  it('clears the offline banner when a query succeeds', () => {
-    render(
-      <QueryFeedback>
-        <SuccessTrigger />
-      </QueryFeedback>
-    );
-
-    act(() => window.dispatchEvent(new Event('offline')));
-    expect(
-      screen.getByText('You are offline — data may be stale')
-    ).toBeInTheDocument();
-
-    fireEvent.click(screen.getByRole('button', { name: 'Succeed' }));
-    expect(
-      screen.queryByText('You are offline — data may be stale')
-    ).not.toBeInTheDocument();
   });
 });

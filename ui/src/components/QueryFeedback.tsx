@@ -1,7 +1,7 @@
 // Copyright (C) 2026 Yota Hamada
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-import { AlertCircle, WifiOff } from 'lucide-react';
+import { AlertCircle } from 'lucide-react';
 import React from 'react';
 import { SWRConfig } from 'swr';
 
@@ -62,15 +62,11 @@ export function isIgnorableQueryError(error: unknown): boolean {
 }
 
 /**
- * Surfaces background query failures and connectivity loss. Wraps children in
- * an SWRConfig that reports fetch errors as unobtrusive corner notices, and
- * shows a banner while the browser is offline.
+ * Surfaces background query failures. Wraps children in an SWRConfig that
+ * reports fetch errors as unobtrusive corner notices.
  */
 export function QueryFeedback({ children }: { children: React.ReactNode }) {
   const [notices, setNotices] = React.useState<Notice[]>([]);
-  const [isOffline, setIsOffline] = React.useState(
-    typeof navigator !== 'undefined' && !navigator.onLine
-  );
   const lastShownRef = React.useRef<Map<string, number>>(new Map());
   const idRef = React.useRef(0);
   const timeoutsRef = React.useRef<Set<ReturnType<typeof setTimeout>>>(
@@ -84,19 +80,6 @@ export function QueryFeedback({ children }: { children: React.ReactNode }) {
       timeouts.clear();
     };
   }, []);
-
-  React.useEffect(() => {
-    const handleOnline = () => setIsOffline(false);
-    const handleOffline = () => setIsOffline(true);
-    window.addEventListener('online', handleOnline);
-    window.addEventListener('offline', handleOffline);
-    return () => {
-      window.removeEventListener('online', handleOnline);
-      window.removeEventListener('offline', handleOffline);
-    };
-  }, []);
-
-  const handleSuccess = React.useCallback(() => setIsOffline(false), []);
 
   const handleError = React.useCallback((error: unknown) => {
     console.error(error);
@@ -134,15 +117,8 @@ export function QueryFeedback({ children }: { children: React.ReactNode }) {
   }, []);
 
   return (
-    <SWRConfig value={{ onError: handleError, onSuccess: handleSuccess }}>
+    <SWRConfig value={{ onError: handleError }}>
       {children}
-
-      {isOffline && (
-        <div className="fixed top-2 left-1/2 -translate-x-1/2 z-[120] flex items-center gap-2 rounded-md border border-destructive/50 bg-destructive px-3 py-1.5 text-xs font-medium text-destructive-foreground shadow-md">
-          <WifiOff className="h-3.5 w-3.5" />
-          You are offline — data may be stale
-        </div>
-      )}
 
       {notices.length > 0 && (
         <div className="fixed bottom-3 right-3 z-[110] flex flex-col gap-2">
