@@ -174,6 +174,13 @@ func (e *docker) Run(ctx context.Context) error {
 		return ErrExecutorConfigRequired
 	}
 
+	// A ctx-only cancel (timeout_sec) stops the container through the client, so
+	// it needs the same stop signal and grace period Kill applies.
+	if e.step.SignalOnStop != "" {
+		e.cfg.StopSignal = e.step.SignalOnStop
+	}
+	e.cfg.StopGrace = env.DAG.MaxCleanUpTime
+
 	logger.Debug(ctx, "Docker executor: initializing new container client",
 		slog.String("image", e.cfg.Image),
 		slog.String("containerName", e.cfg.ContainerName),
@@ -196,7 +203,7 @@ func (e *docker) Run(ctx context.Context) error {
 
 // runInExistingContainer executes commands in an existing container from context.
 func (e *docker) runInExistingContainer(ctx context.Context, cli *Client, tw *executor.TailWriter) error {
-	execOpts := ExecOptions{}
+	execOpts := nativeExecOptions()
 
 	// If no commands, run with empty command (use image default)
 	if len(e.step.Commands) == 0 {
@@ -307,7 +314,7 @@ func (e *docker) runInNewContainer(ctx context.Context, tw *executor.TailWriter)
 			slog.Any("cmd", cmd),
 		)
 
-		exitCode, err := e.container.Exec(ctx, cmd, e.stdout, e.stderr, ExecOptions{})
+		exitCode, err := e.container.Exec(ctx, cmd, e.stdout, e.stderr, nativeExecOptions())
 		e.setExitCode(exitCode)
 
 		if err != nil {

@@ -16,7 +16,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/cmn/runenv"
 
@@ -55,6 +54,11 @@ type providerConfig struct {
 	managed    bool
 	required   bool
 	modeReason string
+}
+
+type containerRunResult struct {
+	exitCode int
+	err      error
 }
 
 type harnessExecutor struct {
@@ -604,14 +608,10 @@ func (e *harnessExecutor) runContainerOnce(ctx context.Context, cfg providerConf
 		cancel()
 	}()
 
-	// Run the container in a goroutine and watch ctx so a cancelled step (e.g.
-	// timeout_sec, which arrives only as ctx cancellation, not as a Stop() call)
-	// stops the container instead of blocking forever in Client.Run's post-wait
-	// loop. Mirrors the host subprocess path in startAndWaitLocked.
-	type containerRunResult struct {
-		exitCode int
-		err      error
-	}
+	// Run the container in a goroutine and watch ctx so a cancelled step
+	// (timeout_sec is ctx-only; the runner does not call Kill) can set exit 124.
+	// Client.Run stops the container as part of its own cancellation path, so the
+	// cancel branch waits for it to unwind rather than stopping the container here.
 	runDone := make(chan containerRunResult, 1)
 	go func() {
 		ec, re := cli.Run(runCtx, runCmd, stdout, tw)
@@ -622,12 +622,12 @@ func (e *harnessExecutor) runContainerOnce(ctx context.Context, cfg providerConf
 	var runErr error
 	select {
 	case <-ctx.Done():
-		// Stop the container via the SDK, then wait for Run to unwind.
-		_ = e.stop(cmdutil.StopRequest{Intent: cmdutil.ForceTermination(), Reason: cmdutil.StopReasonTimeout})
-		<-runDone
+		// Client.Run owns cancellation cleanup and stops the container before it returns.
+		// Closing the client here would race that teardown, so wait for Run to finish.
+		runErr = waitForCanceledContainerRun(ctx, runDone)
 		e.exitCode = 124
 		_ = cleanupStdoutSpool(stdout)
-		return nil, ctx.Err()
+		return nil, runErr
 	case res := <-runDone:
 		exitCode, runErr = res.exitCode, res.err
 	}
@@ -654,6 +654,14 @@ func (e *harnessExecutor) runContainerOnce(ctx context.Context, cfg providerConf
 		return nil, fmt.Errorf("harness: failed to rewind stdout spool: %w", err)
 	}
 	return stdout, nil
+}
+
+func waitForCanceledContainerRun(ctx context.Context, runDone <-chan containerRunResult) error {
+	result := <-runDone
+	if result.err != nil {
+		return result.err
+	}
+	return ctx.Err()
 }
 
 func (e *harnessExecutor) runSharedContainerOnce(ctx context.Context, cfg providerConfig) (*os.File, error) {
@@ -704,7 +712,6 @@ func (e *harnessExecutor) runSharedContainerOnce(ctx context.Context, cfg provid
 	exitCode, runErr := cli.Exec(runCtx, runCmd, stdout, tw, dockerexec.ExecOptions{
 		Env:               sharedContainerHarnessEnv(env.UserEnvsMap()),
 		Direct:            true,
-		PIDFile:           sharedContainerHarnessPIDFile(e.step.Name),
 		TerminateOnCancel: true,
 	})
 	e.exitCode = exitCode
@@ -760,14 +767,6 @@ func sharedContainerHarnessEnv(userEnv map[string]string) []string {
 		envs = append(envs, key+"="+userEnv[key])
 	}
 	return envs
-}
-
-func sharedContainerHarnessPIDFile(stepName string) string {
-	safeStepName := fileutil.SafeName(stepName)
-	if safeStepName == "" {
-		safeStepName = "step"
-	}
-	return fmt.Sprintf("/tmp/dagu-harness-%s-%d.pid", safeStepName, time.Now().UnixNano())
 }
 
 func (e *harnessExecutor) startAndWaitLocked(ctx context.Context, cmd *exec.Cmd, stdout *os.File, tw *executor.TailWriter, logEncoding string) (*os.File, error) {

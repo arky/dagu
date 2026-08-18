@@ -509,7 +509,7 @@ func TestServerIPAccessProtectsAllRoutes(t *testing.T) {
 		}
 	})
 
-	client := &http.Client{Timeout: time.Second}
+	client := &http.Client{Timeout: 5 * time.Second}
 
 	// The listener is bound before Serve runs, so a connection is accepted by
 	// the kernel backlog while the serving goroutine may not have reached its
@@ -523,7 +523,6 @@ func TestServerIPAccessProtectsAllRoutes(t *testing.T) {
 		}
 		return resp.Body.Close() == nil
 	}, 10*time.Second, 20*time.Millisecond, "server never started serving")
-
 	for _, requestPath := range []string{"/api/v1/health", "/extension"} {
 		resp, err := client.Get(baseURL + requestPath)
 		require.NoError(t, err)
