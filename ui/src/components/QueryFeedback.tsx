@@ -96,6 +96,8 @@ export function QueryFeedback({ children }: { children: React.ReactNode }) {
     };
   }, []);
 
+  const handleSuccess = React.useCallback(() => setIsOffline(false), []);
+
   const handleError = React.useCallback((error: unknown) => {
     console.error(error);
 
@@ -132,7 +134,7 @@ export function QueryFeedback({ children }: { children: React.ReactNode }) {
   }, []);
 
   return (
-    <SWRConfig value={{ onError: handleError }}>
+    <SWRConfig value={{ onError: handleError, onSuccess: handleSuccess }}>
       {children}
 
       {isOffline && (
