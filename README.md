@@ -17,7 +17,7 @@
 
 Dagu is a local-first workflow engine for ops automation and AI-assisted operations. It is open source and self-hostable: a single binary with a built-in Web UI, no external database or message broker, running on Linux / Mac / Windows. Define [DAGs](https://en.wikipedia.org/wiki/Directed_acyclic_graph) in a declarative YAML format. It natively supports shell commands, Docker containers, Kubernetes Jobs, remote commands via SSH, external coding-agent CLIs through `harness.run`, and more through Dagu Actions.
 
-Dagu turns existing scripts, runbooks, and agent-driven jobs into production workflows with scheduling, retries, human tasks, and run history. It runs where your data and credentials live: on-prem, air-gapped, edge, or cloud, and scales from a single node to a distributed worker fleet.
+Dagu turns existing scripts, runbooks, and agent-driven jobs into production workflows with scheduling, retries, human tasks, and run history. It runs where your data and credentials live: on-prem, air-gapped, edge, or cloud, and scales from a single node to a fleet of workers.
 
 **Highlights:**
 
@@ -81,7 +81,7 @@ Dagu stores state in local files and reaches production throughput without exter
 
 - **Throughput:** A single machine can run thousands of workflow runs per day. Actual capacity depends on CPU, memory, disk, and workflow shape.
 - **Load control:** Queues, concurrency limits, and resource limits control how many runs execute at once and where they run.
-- **Scale out:** Distributed workers spread execution across machines when one node is not enough.
+- **Scale out:** Workers spread execution across machines when one node is not enough.
 
 ## Real-World Use Cases
 
@@ -168,25 +168,33 @@ Visit http://localhost:8080
 
 ## How You Run Dagu?
 
-Run Dagu on one machine, or scale out with distributed workers. See the [Deployment Models guide](https://docs.dagu.sh/overview/deployment-models).
+Dagu runs on one machine, on temporary workers your platform creates for each run, or on workers you keep running. All three are self-hosted, and the same workflow YAML runs on any of them. See the [Deployment Models guide](https://docs.dagu.sh/overview/deployment-models).
 
 <table>
   <tr>
     <td width="50%" align="center" valign="top">
-      <strong>Single Server</strong><br>
+      <strong>Single server</strong><br>
       <img src="./assets/images/deployment-model-local.gif" width="100%" alt="Single-server deployment model with one Dagu server handling scheduling and execution.">
     </td>
     <td width="50%" align="center" valign="top">
-      <strong>Distributed Workers</strong><br>
-      <img src="./assets/images/deployment-model-self-hosted.gif" width="100%" alt="Distributed-workers deployment model with the Dagu server dispatching to workers on separate machines.">
+      <strong>Temporary workers</strong><br>
+      <img src="./assets/images/deployment-model-shared-volume.gif" width="100%" alt="Deployment model where a launcher provisions a temporary worker per run, the worker writes state to a shared volume and is destroyed, and an always-on Dagu server reads that state.">
     </td>
+  </tr>
+  <tr>
+    <td width="50%" align="center" valign="top">
+      <strong>Distributed workers</strong><br>
+      <img src="./assets/images/deployment-model-self-hosted.gif" width="100%" alt="Distributed-worker deployment where the Dagu server dispatches tasks into a coordinator and workers on separate hosts poll it over gRPC, reporting status and logs back, with the server and persistent volume sharing the same data.">
+    </td>
+    <td width="50%"></td>
   </tr>
 </table>
 
-| Model | Server | Execution | Best for |
-|------|--------|-----------|----------|
-| **Single server** | `dagu start-all` on one machine. | Same machine. | Development, single-machine scheduled workloads, edge jobs, and internal automation. |
-| **Distributed workers** | Dagu server and coordinator on your infrastructure. | Workers on separate machines, routed by labels. | Heavier workloads, private networks, and multiple execution hosts. |
+| Topology | Execution | Best for |
+|----------|-----------|----------|
+| **Single server** | `dagu start-all` runs the server, scheduler, and steps in one process on one machine. | Development, single-machine scheduled workloads, edge jobs, and internal automation. |
+| **Temporary workers** | Cloud Run Jobs, Kubernetes Jobs, or CI provision a worker per run that invokes the binary and is destroyed when the run ends. The server reads run state from a shared volume. | Ephemeral compute, capacity that falls to zero between jobs, and launchers you already operate. |
+| **Distributed workers** | Workers you keep running poll a coordinator over gRPC and are routed work by label. | Docker and private-network steps, warm toolchains, and multiple execution hosts. |
 
 ### Licensing
 
@@ -201,23 +209,25 @@ Run Dagu on one machine, or scale out with distributed workers. See the [Deploym
 - **Reproducibility:** Reproducible runs with pinned tools, plus automatic installation and caching on workers—eliminating the need to manually install dependencies on the server or workers.
 - **Human Tasks:** Pause a workflow for acknowledgement or typed operator input, then expose the response to downstream steps.
 - **Secret management:** Built-in secret management with secure log masking, preventing credentials from leaking into logs or the Web UI.
-- **Self-hosted:** A single binary that runs on Linux, macOS, and Windows. Includes an optional distributed worker mode for scaling out execution across machines.
+- **Self-hosted:** A single binary that runs on Linux, macOS, and Windows. Execution scales out to a fleet of workers.
 - **Permission Control:** RBAC and SSO support for team environments, controlling who can view, run, and edit workflows through granular permissions and audit logging.
 - **MCP Server:** Built-in MCP server for authoring and running workflows via AI agents like Claude Code, Codex, Gemini CLI, Pi, OpenCode, and more.
 - **External CLI Harness:** You can run coding-agent CLIs (Claude Code, Codex, Gemini CLI, Pi, OpenCode, etc.) with a built-in harness action or custom harness definition.
 
 ## Architecture
 
-Dagu can run in three configurations:
+One binary carries every role. Which roles you start, and where, is what the [deployment models](#how-you-run-dagu) differ on.
 
-**Standalone:** A single `dagu start-all` process runs the HTTP server, scheduler, and executor. Suitable for single-machine deployments.
+- **Server** serves the Web UI and REST API.
+- **Scheduler** owns `schedule:` and drains the queue.
+- **Coordinator** is the gRPC endpoint workers poll. It also persists what they report: run status, streamed logs, and artifacts.
+- **Worker** polls a coordinator, executes dispatched runs locally, and reports back. Routed by labels.
+- `dagu start-all` runs the server, scheduler, and coordinator in one process.
 
-**Coordinator/Worker:** The scheduler enqueues jobs to a local file-based queue, then dispatches them to a coordinator over gRPC. Workers long-poll the coordinator for tasks, execute DAGs locally, and report status back. Workers can run on separate machines and are routed tasks based on labels.
-
-**Headless:** Run without the web UI (`DAGU_HEADLESS=true`). Useful for CI/CD environments or when Dagu is managed through the CLI or API only.
+Set `DAGU_HEADLESS=true` to run without the Web UI, which applies to any of the topologies and suits CI or CLI-only environments.
 
 ```sh
-Standalone:
+Single server:
 
   ┌─────────────────────────────────────────┐
   │  dagu start-all                         │
@@ -227,7 +237,7 @@ Standalone:
   │  File-based storage (logs, state, queue)│
   └─────────────────────────────────────────┘
 
-Distributed:
+Distributed workers:
 
   ┌────────────┐                   ┌────────────┐
   │ Scheduler  │                   │ HTTP / UI  │
@@ -256,6 +266,22 @@ Distributed:
           │Worker 1│    │Worker 2│    │Worker N│ Sandbox execution of DAGs
           │        │    │        │    │        │
           └────────┘    └────────┘    └────────┘
+
+Temporary workers:
+
+  ┌────────────┐   provisions   ┌──────────────┐
+  │  Launcher  │───────────────▶│  dagu start  │
+  │ Cloud Run  │                │  exits when  │
+  │ K8s Job/CI │                │ the run ends │
+  └────────────┘                └──────┬───────┘
+                                       │ writes
+                                       ▼
+  ┌────────────┐     reads      ┌──────────────────┐
+  │ Dagu server│◀───────────────│  Shared volume   │
+  │  UI / API  │                │ dags/state/logs  │
+  └────────────┘                └──────────────────┘
+
+  No coordinator, and no network path between the two.
 ```
 
 ## Parameter Definition
@@ -717,10 +743,10 @@ See the [Artifacts documentation](https://docs.dagu.sh/writing-workflows/artifac
 
 ## Distributed Execution
 
-The coordinator/worker architecture distributes DAG execution across multiple machines:
+Operational detail for the [distributed workers](#how-you-run-dagu) topology:
 
 - **Coordinator**: gRPC server that manages task distribution, worker registry, and health monitoring
-- **Workers**: Connect to the coordinator, pull tasks from the queue, execute DAGs locally, report results
+- **Workers**: Poll the coordinator outbound, execute DAGs locally, and report status, logs, and artifacts back. No inbound port required
 - **Worker labels**: Route DAGs to specific workers based on labels (e.g., `gpu=true`, `region=us-east-1`)
 - **Health checks**: HTTP health endpoints on coordinator and workers for load balancer integration
 - **Queue system**: File-based persistent queue with configurable concurrency limits
