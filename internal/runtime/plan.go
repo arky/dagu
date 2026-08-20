@@ -130,8 +130,20 @@ func NewPlanFromNodes(nodes ...*Node) (*Plan, error) {
 	return p, nil
 }
 
+// StepRetryPlanOptions configures a targeted step retry plan.
+type StepRetryPlanOptions struct {
+	// IncludeDownstream resets the selected step and every reachable descendant.
+	// Unrelated branches keep their existing status.
+	IncludeDownstream bool
+}
+
 // CreateStepRetryPlan creates a new execution plan for retrying a specific step.
 func CreateStepRetryPlan(dag *ir.DAG, nodes []*Node, stepName string) (*Plan, error) {
+	return CreateStepRetryPlanWithOptions(dag, nodes, stepName, StepRetryPlanOptions{})
+}
+
+// CreateStepRetryPlanWithOptions creates a step retry plan with explicit options.
+func CreateStepRetryPlanWithOptions(dag *ir.DAG, nodes []*Node, stepName string, opts StepRetryPlanOptions) (*Plan, error) {
 	p := &Plan{
 		nodeByID:      make(map[int]*Node),
 		nodeByName:    make(map[string]*Node),
@@ -161,21 +173,87 @@ func CreateStepRetryPlan(dag *ir.DAG, nodes []*Node, stepName string) (*Plan, er
 	if targetNode == nil {
 		return nil, fmt.Errorf("%w: %s", ErrMissingNode, stepName)
 	}
-	preserveRetryBudget := targetNode.State().Status == ir.NodeRetrying
-
-	step, err := retryStepForNode(targetNode, steps)
-	if err != nil {
+	if err := resetStepRetryNode(targetNode, steps, targetNode.State().Status == ir.NodeRetrying); err != nil {
 		return nil, err
 	}
 
-	retryCount := targetNode.GetRetryCount()
-	clearNodeForRetry(targetNode, step)
-	targetNode.SetRetryCount(retryCount)
-	if !preserveRetryBudget {
-		targetNode.retryPolicy = RetryPolicy{} // manual step retries start with a fresh retry budget
+	if opts.IncludeDownstream {
+		resetIDs := map[int]struct{}{targetNode.id: {}}
+		for _, node := range p.reachableDescendants(targetNode) {
+			resetIDs[node.id] = struct{}{}
+			if err := resetStepRetryNode(node, steps, false); err != nil {
+				return nil, err
+			}
+		}
+		p.markSkippedSidePrerequisites(resetIDs)
 	}
 
 	return p, nil
+}
+
+func resetStepRetryNode(node *Node, steps map[string]ir.Step, preserveRetryBudget bool) error {
+	step, err := retryStepForNode(node, steps)
+	if err != nil {
+		return err
+	}
+
+	retryCount := node.GetRetryCount()
+	clearNodeForRetry(node, step)
+	node.SetRetryCount(retryCount)
+	if !preserveRetryBudget {
+		node.retryPolicy = RetryPolicy{} // manual step retries start with a fresh retry budget
+	}
+	return nil
+}
+
+// reachableDescendants returns nodes reachable from the given node through
+// explicit dependency edges, excluding the node itself.
+func (p *Plan) reachableDescendants(node *Node) []*Node {
+	if node == nil {
+		return nil
+	}
+	seen := map[int]struct{}{node.id: {}}
+	var result []*Node
+	queue := []int{node.id}
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		for _, id := range p.DependantMap[current] {
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			desc := p.nodeByID[id]
+			if desc == nil {
+				continue
+			}
+			result = append(result, desc)
+			queue = append(queue, id)
+		}
+	}
+	return result
+}
+
+// markSkippedSidePrerequisites converts preserved ordinary skipped
+// prerequisites of reset join descendants to SkippedByRetry so the runner
+// can re-execute those descendants without treating the skipped side as a
+// hard skip.
+func (p *Plan) markSkippedSidePrerequisites(resetIDs map[int]struct{}) {
+	for id := range resetIDs {
+		for _, depID := range p.DependencyMap[id] {
+			if _, reset := resetIDs[depID]; reset {
+				continue
+			}
+			dep := p.nodeByID[depID]
+			if dep == nil {
+				continue
+			}
+			state := dep.State()
+			if state.Status == ir.NodeSkipped && !state.SkippedByRetry {
+				dep.SetSkippedByRetry(true)
+			}
+		}
+	}
 }
 
 // IsAgent reports whether execution order is decided by an agent step

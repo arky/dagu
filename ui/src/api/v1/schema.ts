@@ -1020,7 +1020,7 @@ export interface paths {
         put?: never;
         /**
          * Retry DAG-run execution
-         * @description Creates a new DAG-run based on a previous execution
+         * @description Retries the existing DAG-run by reusing its DAG-run ID rather than creating a new DAG-run. Resets only the selected step or reachable descendants.
          */
         post: operations["retryDAGRun"];
         delete?: never;
@@ -9954,8 +9954,10 @@ export interface operations {
             content: {
                 "application/json": {
                     dagRunId: components["schemas"]["DAGRunId"] & unknown;
-                    /** @description Optional. If provided, only this step will be retried. */
+                    /** @description Optional. If provided, this step will be retried. Combine with includeDownstream to also reset reachable descendants. */
                     stepName?: string;
+                    /** @description Optional. When true, retry the selected step and every reachable descendant. Requires stepName. Unrelated branches keep their existing status. */
+                    includeDownstream?: boolean;
                     subDAGRunId?: components["schemas"]["DAGRunId"] & unknown;
                 };
             };

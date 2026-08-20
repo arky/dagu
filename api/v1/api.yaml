@@ -2735,7 +2735,7 @@ paths:
   /dag-runs/{name}/{dagRunId}/retry:
     post:
       summary: "Retry DAG-run execution"
-      description: "Creates a new DAG-run based on a previous execution"
+      description: "Retries the existing DAG-run by reusing its DAG-run ID rather than creating a new DAG-run. Resets only the selected step or reachable descendants."
       operationId: "retryDAGRun"
       tags:
         - "dag-runs"
@@ -2749,6 +2749,8 @@ paths:
           application/json:
             schema:
               type: object
+              required:
+                - dagRunId
               properties:
                 dagRunId:
                   allOf:
@@ -2756,13 +2758,28 @@ paths:
                     - description: "ID of the DAG-run to retry"
                 stepName:
                   type: string
-                  description: "Optional. If provided, only this step will be retried."
+                  description: "Optional. If provided, this step will be retried. Combine with includeDownstream to also reset reachable descendants."
+                includeDownstream:
+                  type: boolean
+                  description: "Optional. When true, retry the selected step and every reachable descendant. Requires stepName. Unrelated branches keep their existing status."
                 subDAGRunId:
                   allOf:
                     - $ref: "#/components/schemas/DAGRunId"
                     - description: "Optional. Persisted child DAG-run containing the step. Requires stepName; the path and dagRunId remain the root DAG-run."
-              required:
-                - dagRunId
+              not:
+                allOf:
+                  - type: object
+                    required:
+                      - includeDownstream
+                    properties:
+                      includeDownstream:
+                        type: boolean
+                        enum:
+                          - true
+                  - not:
+                      type: object
+                      required:
+                        - stepName
       responses:
         "200":
           description: "A successful response"

@@ -66,6 +66,7 @@ type DispatchTask struct {
 	WorkerSelector map[string]string
 
 	ExternalStepRetry bool
+	IncludeDownstream bool
 	RetryPath         string
 
 	WorkspaceBundleDigest      string

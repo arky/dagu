@@ -160,6 +160,8 @@ message Task {
   string parallel_item = 36;
   // Exact worker required to resume a host-owned agent session.
   string target_worker_id = 37;
+  // When true, a targeted step retry also resets reachable descendants.
+  bool include_downstream = 38;
 }
 
 enum Operation {

@@ -261,10 +261,10 @@ func (c *coordinatorServiceClient) GetWorkspaceBundle(ctx context.Context, in *G
 		return nil, err
 	}
 	x := &grpc.GenericClientStream[GetWorkspaceBundleRequest, WorkspaceBundleChunk]{ClientStream: stream}
-	if err := x.SendMsg(in); err != nil {
+	if err := x.ClientStream.SendMsg(in); err != nil {
 		return nil, err
 	}
-	if err := x.CloseSend(); err != nil {
+	if err := x.ClientStream.CloseSend(); err != nil {
 		return nil, err
 	}
 	return x, nil
