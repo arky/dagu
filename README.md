@@ -15,9 +15,9 @@
 
 <h1>Dagu</h1>
 
-Dagu is a local-first workflow engine for ops automation and AI-assisted operations. It is open source and self-hostable: a single binary with a built-in Web UI, no external database or message broker, running on Linux / Mac / Windows. Define [DAGs](https://en.wikipedia.org/wiki/Directed_acyclic_graph) in a declarative YAML format. It natively supports shell commands, Docker containers, Kubernetes Jobs, remote commands via SSH, external coding-agent CLIs through `harness.run`, and more through Dagu Actions.
+Dagu is a local-first workflow engine for operations and internal automation. It is open source and self-hostable: a single binary with a built-in Web UI, no external database or message broker, running on Linux / Mac / Windows. Define [DAGs](https://en.wikipedia.org/wiki/Directed_acyclic_graph) in a declarative YAML format. It natively supports shell commands, Docker containers, Kubernetes Jobs, remote commands via SSH, and more through Dagu Actions.
 
-Dagu turns existing scripts, runbooks, and agent-driven jobs into production workflows with scheduling, retries, human tasks, and run history. It runs where your data and credentials live: on-prem, air-gapped, edge, or cloud, and scales from a single node to a fleet of workers.
+Dagu turns existing scripts and runbooks into production workflows with scheduling, retries, human tasks, and run history. It runs where your data and credentials live: on-prem, air-gapped, edge, or cloud, and scales from a single node to a fleet of workers.
 
 **Highlights:**
 
@@ -29,8 +29,7 @@ Dagu turns existing scripts, runbooks, and agent-driven jobs into production wor
 - Compose reusable Sub-DAGs and run work in parallel with concurrency controls.
 - Schedule workflows with cron syntax, timezones, overlap policies, and catch-up windows.
 - Keep logs, run history, retries, notifications, and webhook triggers in one place.
-- Built-in MCP support for AI agents to manage workflows.
-- Run external coding-agent CLIs through `harness.run` when workflows need AI assistance.
+- Built-in MCP server for inspecting workflows and runs, maintaining Wiki pages, applying changes, and controlling runs.
 
 ## Quick Look
 
@@ -211,8 +210,7 @@ Dagu runs on one machine, on temporary workers your platform creates for each ru
 - **Secret management:** Built-in secret management with secure log masking, preventing credentials from leaking into logs or the Web UI.
 - **Self-hosted:** A single binary that runs on Linux, macOS, and Windows. Execution scales out to a fleet of workers.
 - **Permission Control:** RBAC and SSO support for team environments, controlling who can view, run, and edit workflows through granular permissions and audit logging.
-- **MCP Server:** Built-in MCP server for authoring and running workflows via AI agents like Claude Code, Codex, Gemini CLI, Pi, OpenCode, and more.
-- **External CLI Harness:** You can run coding-agent CLIs (Claude Code, Codex, Gemini CLI, Pi, OpenCode, etc.) with a built-in harness action or custom harness definition.
+- **MCP Server:** Authenticated MCP clients can inspect workflows and runs, maintain Wiki pages, apply changes, and control runs.
 
 ## Architecture
 
@@ -542,19 +540,11 @@ steps:
 
 For more examples, see the [Examples documentation](https://docs.dagu.sh/writing-workflows/examples).
 
-## Additional Capabilities
+## MCP
 
-### AI and agent integrations
+Dagu includes a built-in MCP server at `http://localhost:8080/mcp`. MCP clients can inspect workflows and run state, maintain Dagu's built-in Wiki pages, preview and apply DAG or Wiki page changes, and control runs through the same authenticated server boundary as the REST API.
 
-Dagu exposes a built-in MCP server at `http://localhost:8080/mcp` for reading Dagu state, changing workflows, and controlling runs. See the [MCP setup guide](https://docs.dagu.sh/mcp/quickstart).
-
-External coding-agent CLIs can run as workflow steps through `harness.run`, and Agent DAGs can let an LLM choose the next step. The complete examples live in the [Harness examples](https://docs.dagu.sh/writing-workflows/examples/harness-run), [AI examples](https://docs.dagu.sh/writing-workflows/examples/ai), and [Agent DAG documentation](https://docs.dagu.sh/writing-workflows/agent).
-
-For authoring-only help in Claude Code, Codex, Gemini CLI, and other AI coding tools, install the Dagu workflow authoring skill:
-
-```sh
-gh skill install dagucloud/dagu dagu
-```
+See the [MCP overview](https://docs.dagu.sh/mcp/) and [quickstart](https://docs.dagu.sh/mcp/quickstart).
 
 ## Built-in Actions
 
