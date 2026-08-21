@@ -47,7 +47,7 @@ type SubDAGExecutor struct {
 	// workerSelector overrides the child DAG's selector for this invocation.
 	workerSelector map[string]string
 
-	// workspaceSeed carries immutable action source content for action sub-DAGs.
+	// workspaceSeed carries immutable files for child DAG execution.
 	workspaceSeed *WorkspaceSeed
 
 	mu         sync.Mutex
@@ -63,6 +63,8 @@ type SubDAGExecutor struct {
 	externalStepRetry bool
 }
 
+// WorkspaceSeed contains workspace contents shared across a DAG-run hierarchy.
+// The seed and its archive must not be mutated after being passed to an executor.
 type WorkspaceSeed struct {
 	Descriptor workspacebundle.Descriptor
 	Archive    []byte
@@ -93,7 +95,11 @@ func NewSubDAGExecutor(ctx context.Context, childName string) (*SubDAGExecutor, 
 			dag := localDAG.Clone()
 			dag.Location = tempFile
 
-			return newSubDAGExecutor(ctx, rCtx, dag, tempFile), nil
+			executor := newSubDAGExecutor(ctx, rCtx, dag, tempFile)
+			if seed, ok := workspaceSeedFromContext(ctx); ok {
+				executor.SetWorkspaceSeed(seed)
+			}
+			return executor, nil
 		}
 	}
 
@@ -143,10 +149,7 @@ func (e *SubDAGExecutor) SetWorkerSelector(selector map[string]string) {
 }
 
 func (e *SubDAGExecutor) SetWorkspaceSeed(seed WorkspaceSeed) {
-	e.workspaceSeed = &WorkspaceSeed{
-		Descriptor: seed.Descriptor,
-		Archive:    append([]byte(nil), seed.Archive...),
-	}
+	e.workspaceSeed = &seed
 }
 
 func (e *SubDAGExecutor) effectiveWorkerSelector() map[string]string {

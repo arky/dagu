@@ -227,7 +227,7 @@ func (r *Local) Run(ctx context.Context, req executor.SubWorkflowRequest) (*ir.R
 		return statusToRunStatus(retryTarget, req.RunID), nil
 	}
 
-	dag, cleanup, err := loadInProcessDAG(ctx, req)
+	dag, workspaceDir, cleanup, err := loadInProcessDAG(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -235,6 +235,13 @@ func (r *Local) Run(ctx context.Context, req executor.SubWorkflowRequest) (*ir.R
 
 	opts := rtagent.Options{
 		TriggerType: ir.TriggerTypeSubDAG,
+		WorkDir:     workspaceDir,
+	}
+	if req.Workspace != nil {
+		opts.WorkspaceSeed = &executor.WorkspaceSeed{
+			Descriptor: req.Workspace.Descriptor,
+			Archive:    req.Workspace.Archive,
+		}
 	}
 	if retryTarget != nil {
 		opts.RetryTarget = retryTarget
@@ -317,18 +324,26 @@ func (r *Local) Retry(ctx context.Context, req executor.SubWorkflowRetryRequest)
 		return nil, err
 	}
 
-	dag, cleanup, err := loadInProcessDAG(ctx, req.SubWorkflowRequest)
+	dag, workspaceDir, cleanup, err := loadInProcessDAG(ctx, req.SubWorkflowRequest)
 	if err != nil {
 		return nil, err
 	}
 	defer cleanup()
 
-	child, err := r.newAgent(ctx, req.SubWorkflowRequest, dag, rtagent.Options{
+	opts := rtagent.Options{
 		RetryTarget:       retryTarget,
 		StepRetry:         req.StepName,
 		IncludeDownstream: req.IncludeDownstream,
 		TriggerType:       inProcessRetryTriggerType(retryTarget),
-	})
+		WorkDir:           workspaceDir,
+	}
+	if req.Workspace != nil {
+		opts.WorkspaceSeed = &executor.WorkspaceSeed{
+			Descriptor: req.Workspace.Descriptor,
+			Archive:    req.Workspace.Archive,
+		}
+	}
+	child, err := r.newAgent(ctx, req.SubWorkflowRequest, dag, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -552,14 +567,18 @@ func validateInProcessRequest(req executor.SubWorkflowRequest) error {
 func loadInProcessDAG(
 	ctx context.Context,
 	req executor.SubWorkflowRequest,
-) (*ir.DAG, func(), error) {
+) (*ir.DAG, string, func(), error) {
 	cleanup := func() {}
 	workDir := req.WorkDir
+	workspaceDir := ""
 	target := req.DAG.Location
 	if req.Workspace != nil {
-		workspaceDir, workspaceTarget, workspaceCleanup, err := materializeLocalWorkspace(req)
+		var workspaceTarget string
+		var workspaceCleanup func()
+		var err error
+		workspaceDir, workspaceTarget, workspaceCleanup, err = materializeLocalWorkspace(req)
 		if err != nil {
-			return nil, nil, err
+			return nil, "", nil, err
 		}
 		cleanup = workspaceCleanup
 		workDir = workspaceDir
@@ -581,7 +600,7 @@ func loadInProcessDAG(
 	}
 	if err != nil {
 		cleanup()
-		return nil, nil, fmt.Errorf("failed to load child workflow DAG: %w", err)
+		return nil, "", nil, fmt.Errorf("failed to load child workflow DAG: %w", err)
 	}
 	// Build paths remain anchored to the authored definition when a local
 	// child is reloaded from a temporary copy.
@@ -592,7 +611,7 @@ func loadInProcessDAG(
 		dag.WorkingDir = req.DAG.WorkingDir
 	}
 	dag.SourceFile = req.DAG.SourceFile
-	return dag, cleanup, nil
+	return dag, workspaceDir, cleanup, nil
 }
 
 func inProcessLoadOptions(
@@ -618,16 +637,10 @@ func inProcessLoadOptions(
 		loadOpts = append(loadOpts, spec.WithDefaultWorkingDir(workDir))
 	}
 
-	if req.Workspace == nil {
-		baseConfig := req.DAG.BaseConfigData
-		if len(baseConfig) == 0 && req.ParentDAG != nil {
-			baseConfig = req.ParentDAG.BaseConfigData
-		}
-		if len(baseConfig) > 0 {
-			loadOpts = append(loadOpts, spec.WithBaseConfigContent(baseConfig))
-		} else if cfg != nil && cfg.Paths.BaseConfig != "" {
-			loadOpts = append(loadOpts, spec.WithBaseConfig(cfg.Paths.BaseConfig))
-		}
+	if baseConfig := subWorkflowBaseConfig(req); len(baseConfig) > 0 {
+		loadOpts = append(loadOpts, spec.WithBaseConfigContent(baseConfig))
+	} else if req.Workspace == nil && cfg != nil && cfg.Paths.BaseConfig != "" {
+		loadOpts = append(loadOpts, spec.WithBaseConfig(cfg.Paths.BaseConfig))
 	}
 	return loadOpts
 }
