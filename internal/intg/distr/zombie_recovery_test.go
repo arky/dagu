@@ -539,7 +539,7 @@ worker_selector:
   test: "true"
 steps:
   - name: step1
-    run: echo "hello"
+    action: noop
 `,
 	)
 	defer f.cleanup()

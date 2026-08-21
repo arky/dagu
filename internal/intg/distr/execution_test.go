@@ -90,13 +90,6 @@ func logOutputCommands(stdout, stderr string) string {
 	)
 }
 
-func readFileCommand(path string) string {
-	if runtime.GOOS == "windows" {
-		return fmt.Sprintf("Get-Content -Raw -LiteralPath %s", test.PowerShellQuote(path))
-	}
-	return fmt.Sprintf("cat %s", test.PosixQuote(path))
-}
-
 func indentYAMLBlock(s string, spaces int) string {
 	prefix := strings.Repeat(" ", spaces)
 	lines := strings.Split(s, "\n")
@@ -762,9 +755,11 @@ steps:
   - name: read-dependency
     dependencies:
       - `+dependencyPath+`
-`+logStepShellYAML()+`    command: |
-`+indentYAMLBlock(readFileCommand(dependencyPath), 6)+`
-`, withLogPersistence(), withWorkerCount(0))
+    action: file.read
+    with:
+      path: `+dependencyPath+`
+    output: CONTENT
+`, withWorkerCount(0))
 	defer f.cleanup()
 
 	sourceDependency := filepath.Join(filepath.Dir(f.dagWrapper.SourceFile), filepath.FromSlash(dependencyPath))
@@ -805,7 +800,8 @@ steps:
 	status := f.waitForStatus(ir.Succeeded, executionStatusTimeout())
 	f.assertWorkerID(status, "worker-1")
 	f.assertAllNodesSucceeded(status)
-	assertLogContains(t, f.logDir(), f.dagWrapper.Name, status.DAGRunID, "read-dependency", dependencyContent)
+	require.Len(t, status.Nodes, 1)
+	assert.Equal(t, dependencyContent, nodeOutputValue(t, status.Nodes[0], "CONTENT"))
 }
 
 func TestExecution_QueueLifecycle(t *testing.T) {
