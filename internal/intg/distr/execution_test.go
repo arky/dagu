@@ -90,6 +90,13 @@ func logOutputCommands(stdout, stderr string) string {
 	)
 }
 
+func readFileCommand(path string) string {
+	if runtime.GOOS == "windows" {
+		return fmt.Sprintf("Get-Content -Raw -LiteralPath %s", test.PowerShellQuote(path))
+	}
+	return fmt.Sprintf("cat %s", test.PosixQuote(path))
+}
+
 func indentYAMLBlock(s string, spaces int) string {
 	prefix := strings.Repeat(" ", spaces)
 	lines := strings.Split(s, "\n")
@@ -738,6 +745,67 @@ steps:
 		assertLogContains(t, f.logDir(), f.dagWrapper.Name, status.DAGRunID, "read-from-workdir", "hello")
 	})
 
+}
+
+func TestExecution_FileDependencies(t *testing.T) {
+	const (
+		dependencyPath    = "fixtures/message.txt"
+		dependencyContent = "dependency from coordinator"
+	)
+
+	f := newTestFixture(t, `
+type: graph
+name: file-dependency-worker-test
+worker_selector:
+  test: "true"
+steps:
+  - name: read-dependency
+    dependencies:
+      - `+dependencyPath+`
+`+logStepShellYAML()+`    command: |
+`+indentYAMLBlock(readFileCommand(dependencyPath), 6)+`
+`, withLogPersistence(), withWorkerCount(0))
+	defer f.cleanup()
+
+	sourceDependency := filepath.Join(filepath.Dir(f.dagWrapper.SourceFile), filepath.FromSlash(dependencyPath))
+	require.NoError(t, os.MkdirAll(filepath.Dir(sourceDependency), 0o750))
+	require.NoError(t, os.WriteFile(sourceDependency, []byte(dependencyContent), 0o600))
+
+	taskClaimed := make(chan struct{})
+	releaseTask := make(chan struct{})
+	var claimOnce sync.Once
+	afterTaskAck := func(ctx context.Context, _ *coordinatorv1.Task) bool {
+		claimOnce.Do(func() { close(taskClaimed) })
+		select {
+		case <-releaseTask:
+			return false
+		case <-ctx.Done():
+			return true
+		}
+	}
+	f.workers = append(f.workers, f.setupWorkerWithAfterAckHook(
+		"worker-1",
+		map[string]string{"test": "true"},
+		"",
+		afterTaskAck,
+	))
+
+	require.NoError(t, f.enqueue())
+	f.waitForQueued()
+	f.startScheduler(30 * time.Second)
+
+	select {
+	case <-taskClaimed:
+	case <-time.After(distrTestTimeout(executionStatusTimeout())):
+		t.Fatal("worker did not claim the dependency task")
+	}
+	require.NoError(t, os.Remove(sourceDependency))
+	close(releaseTask)
+
+	status := f.waitForStatus(ir.Succeeded, executionStatusTimeout())
+	f.assertWorkerID(status, "worker-1")
+	f.assertAllNodesSucceeded(status)
+	assertLogContains(t, f.logDir(), f.dagWrapper.Name, status.DAGRunID, "read-dependency", dependencyContent)
 }
 
 func TestExecution_QueueLifecycle(t *testing.T) {
