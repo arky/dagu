@@ -145,11 +145,10 @@ func findDAGRunInDay(ctx context.Context, dayPath, dagRunID, artifactDir string)
 		return nil, err
 	}
 
-	for i := len(entries) - 1; i >= 0; i-- {
+	for _, entry := range slices.Backward(entries) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		entry := entries[i]
 		if !entry.IsDir() {
 			continue
 		}
