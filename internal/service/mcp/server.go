@@ -109,21 +109,6 @@ type changeInput struct {
 	NewPath   string `json:"newPath,omitempty" jsonschema:"Destination Wiki page or directory path for rename_wiki_page."`
 }
 
-type executeInput struct {
-	Action            string   `json:"action" jsonschema:"Execution action: start, enqueue, retry, or stop."`
-	TargetType        string   `json:"targetType,omitempty" jsonschema:"Target type: dag, inline_spec, or run. Defaults from action and spec."`
-	Name              string   `json:"name,omitempty" jsonschema:"DAG name, or optional inline spec name."`
-	Spec              string   `json:"spec,omitempty" jsonschema:"Inline DAG YAML spec for start or enqueue with targetType inline_spec."`
-	DAGRunID          string   `json:"dagRunId,omitempty" jsonschema:"DAG-run ID for start/enqueue override, retry, and stop."`
-	Params            string   `json:"params,omitempty" jsonschema:"Runtime parameters as a JSON string."`
-	Queue             string   `json:"queue,omitempty" jsonschema:"Queue override for enqueue."`
-	Singleton         bool     `json:"singleton,omitempty" jsonschema:"Prevent duplicate running or queued DAG-runs when supported by the action."`
-	NoReuse           bool     `json:"noReuse,omitempty" jsonschema:"Execute eligible build steps without reusing prior materializations for start or enqueue."`
-	Labels            []string `json:"labels,omitempty" jsonschema:"Additional labels, each as key=value or key-only."`
-	StepName          string   `json:"stepName,omitempty" jsonschema:"Optional step name for retry."`
-	IncludeDownstream bool     `json:"includeDownstream,omitempty" jsonschema:"When true, retry the selected step and every reachable descendant. Requires stepName."`
-}
-
 func registerTools(server *mcpsdk.Server, svc *Service) {
 	falsePtr := new(false)
 	truePtr := new(true)
@@ -153,11 +138,12 @@ func registerTools(server *mcpsdk.Server, svc *Service) {
 		},
 	}, svc.changeTool)
 
-	mcpsdk.AddTool(server, &mcpsdk.Tool{
+	server.AddTool(&mcpsdk.Tool{
 		Meta:        runInspectorToolMeta(),
 		Name:        toolExecute,
 		Title:       "Execute, enqueue, retry, or stop DAG-runs",
-		Description: "Run control entry point. action=start or enqueue launches a DAG or inline spec; action=retry retries a DAG-run; action=stop terminates a DAG-run.",
+		Description: "Run control entry point. action=start or enqueue launches a DAG or inline spec; action=retry retries a DAG-run; action=stop terminates a DAG-run. Set wait=true to wait for the run result.",
+		InputSchema: executeToolInputSchema(),
 		Annotations: &mcpsdk.ToolAnnotations{
 			DestructiveHint: truePtr,
 			OpenWorldHint:   falsePtr,
@@ -218,28 +204,6 @@ func registerResources(server *mcpsdk.Server, svc *Service) {
 		MIMEType:    resourceMIMEText,
 	}, svc.readResource)
 
-	server.AddResource(&mcpsdk.Resource{
-		URI:         legacyReadResourceDocsCollectionURI,
-		Name:        "documents_legacy",
-		Title:       "Legacy Docs (deprecated)",
-		Description: "Deprecated alias for the Wiki collection.",
-		MIMEType:    resourceMIMEJSON,
-	}, svc.readResource)
-	server.AddResourceTemplate(&mcpsdk.ResourceTemplate{
-		URITemplate: "dagu://docs/{workspace}",
-		Name:        "workspace_documents_legacy",
-		Title:       "Legacy workspace Docs (deprecated)",
-		Description: "Deprecated alias for a workspace Wiki tree.",
-		MIMEType:    resourceMIMEJSON,
-	}, svc.readResource)
-	server.AddResourceTemplate(&mcpsdk.ResourceTemplate{
-		URITemplate: "dagu://docs/{workspace}/{path}",
-		Name:        "document_legacy",
-		Title:       "Legacy Docs page (deprecated)",
-		Description: "Deprecated alias for a Wiki page.",
-		MIMEType:    resourceMIMEText,
-	}, svc.readResource)
-
 	server.AddResourceTemplate(&mcpsdk.ResourceTemplate{
 		URITemplate: "dagu://runs/{name}/{dagRunId}",
 		Name:        "dag_run",
@@ -260,7 +224,23 @@ func registerResources(server *mcpsdk.Server, svc *Service) {
 		URITemplate: "dagu://runs/{name}/{dagRunId}/steps/{stepName}/logs",
 		Name:        "dag_run_step_log",
 		Title:       "DAG-run step log",
-		Description: "Standard output and standard error for a DAG-run step.",
+		Description: "Standard output and standard error for a DAG-run step. Supports tail, head, offset, limit, and stream query parameters.",
+		MIMEType:    resourceMIMEJSON,
+	}, svc.readResource)
+
+	server.AddResourceTemplate(&mcpsdk.ResourceTemplate{
+		URITemplate: "dagu://runs/{name}/{dagRunId}/sub/{subRunId}",
+		Name:        "sub_dag_run",
+		Title:       "Sub DAG-run details",
+		Description: "Current details for a child DAG-run addressed under its root run.",
+		MIMEType:    resourceMIMEJSON,
+	}, svc.readResource)
+
+	server.AddResourceTemplate(&mcpsdk.ResourceTemplate{
+		URITemplate: "dagu://runs/{name}/{dagRunId}/sub/{subRunId}/steps/{stepName}/logs",
+		Name:        "sub_dag_run_step_log",
+		Title:       "Sub DAG-run step log",
+		Description: "Standard output and standard error for a child DAG-run step. Supports tail, head, offset, limit, and stream query parameters.",
 		MIMEType:    resourceMIMEJSON,
 	}, svc.readResource)
 }
@@ -308,27 +288,6 @@ func registerPrompts(server *mcpsdk.Server) {
 	}, promptEditWikiPage)
 
 	server.AddPrompt(&mcpsdk.Prompt{
-		Name:        "dagu_create_doc",
-		Title:       "Create a Dagu document (deprecated)",
-		Description: "Deprecated alias for dagu_create_wiki_page.",
-		Arguments: []*mcpsdk.PromptArgument{
-			{Name: "workspace", Description: "default or a workspace name.", Required: true},
-			{Name: "path", Description: "Wiki page path without .md.", Required: true},
-			{Name: "goal", Description: "What the Wiki page should contain.", Required: true},
-		},
-	}, promptCreateWikiPage)
-	server.AddPrompt(&mcpsdk.Prompt{
-		Name:        "dagu_edit_doc",
-		Title:       "Edit a Dagu document (deprecated)",
-		Description: "Deprecated alias for dagu_edit_wiki_page.",
-		Arguments: []*mcpsdk.PromptArgument{
-			{Name: "workspace", Description: "default or a workspace name.", Required: true},
-			{Name: "path", Description: "Wiki page path without .md.", Required: true},
-			{Name: "change", Description: "Requested change.", Required: true},
-		},
-	}, promptEditWikiPage)
-
-	server.AddPrompt(&mcpsdk.Prompt{
 		Name:        "dagu_debug_failed_run",
 		Title:       "Debug a failed Dagu run",
 		Description: "Read a run and logs, explain the likely failure, then offer retry or stop as appropriate.",
@@ -337,95 +296,6 @@ func registerPrompts(server *mcpsdk.Server) {
 			{Name: "dagRunId", Description: "DAG-run ID.", Required: true},
 		},
 	}, promptDebugRun)
-}
-
-func (svc *Service) executeTool(ctx context.Context, req *mcpsdk.CallToolRequest, input executeInput) (*mcpsdk.CallToolResult, map[string]any, error) {
-	return auditToolCall(ctx, svc.api, req, toolExecute, executeAuditMetadata(input), func(ctx context.Context) (*mcpsdk.CallToolResult, map[string]any, error) {
-		return svc.executeToolImpl(ctx, input)
-	})
-}
-
-func (svc *Service) executeToolImpl(ctx context.Context, input executeInput) (*mcpsdk.CallToolResult, map[string]any, error) {
-	if err := svc.requireAPI(); err != nil {
-		return nil, nil, err
-	}
-
-	action := strings.TrimSpace(input.Action)
-	if action == "" {
-		return nil, nil, errors.New("action is required")
-	}
-
-	targetType := strings.TrimSpace(input.TargetType)
-	if targetType == "" {
-		switch {
-		case action == "retry" || action == "stop":
-			targetType = "run"
-		case strings.TrimSpace(input.Spec) != "":
-			targetType = "inline_spec"
-		default:
-			targetType = "dag"
-		}
-	}
-
-	var (
-		dagRunID string
-		err      error
-	)
-
-	switch action {
-	case "start":
-		dagRunID, err = svc.startDAG(ctx, targetType, input)
-	case "enqueue":
-		dagRunID, err = svc.enqueueDAG(ctx, targetType, input)
-	case "retry":
-		err = requireRetry(input)
-		if err == nil {
-			err = svc.retryDAGRun(ctx, input)
-			dagRunID = input.DAGRunID
-		}
-	case "stop":
-		err = requireRun(input.Name, input.DAGRunID)
-		if err == nil {
-			err = svc.stopDAGRun(ctx, input)
-			dagRunID = input.DAGRunID
-		}
-	default:
-		err = fmt.Errorf("unsupported execute action %q", action)
-	}
-	if err != nil {
-		return nil, nil, err
-	}
-
-	output := map[string]any{
-		"action":     action,
-		"targetType": targetType,
-		"dagName":    input.Name,
-		"dagRunId":   dagRunID,
-		"references": defaultReferenceURIs(),
-	}
-	links := []resourceLink{}
-	if input.Name != "" && dagRunID != "" {
-		run := runURI(input.Name, dagRunID)
-		logs := runLogsURI(input.Name, dagRunID)
-		output["runUri"] = run
-		output["logsUri"] = logs
-		output["subscribe"] = "Subscribe to " + run + " to receive an MCP resource update notification when the run reaches a terminal state."
-		links = append(links, resourceLink{
-			uri:         run,
-			name:        "dag_run",
-			title:       "DAG-run details",
-			description: "Subscribe to this resource for completion notification.",
-			mimeType:    resourceMIMEJSON,
-		}, resourceLink{
-			uri:         logs,
-			name:        "dag_run_logs",
-			title:       "DAG-run logs",
-			description: "Logs for this DAG-run.",
-			mimeType:    resourceMIMEJSON,
-		})
-	}
-
-	return resultWithLinks("Dagu execute action completed.", links...), output, nil
 }
 
 func (svc *Service) getDAGSpec(ctx context.Context, name string) (map[string]any, error) {
@@ -443,6 +313,65 @@ func (svc *Service) getDAGSpec(ctx context.Context, name string) (map[string]any
 	default:
 		return nil, fmt.Errorf("unexpected get DAG spec response %T", resp)
 	}
+}
+
+func (svc *Service) searchDAGs(ctx context.Context, workspace, search, cursor string, limit int) (map[string]any, error) {
+	params := daguapi.SearchDAGFeedParams{Q: search}
+	if workspace != "" {
+		value := daguapi.Workspace(workspace)
+		params.Workspace = &value
+	}
+	if cursor != "" {
+		value := daguapi.SearchCursor(cursor)
+		params.Cursor = &value
+	}
+	if limit != 0 {
+		value := daguapi.SearchLimit(limit)
+		params.Limit = &value
+	}
+
+	resp, err := svc.api.SearchDAGFeed(ctx, daguapi.SearchDAGFeedRequestObject{Params: params})
+	if err != nil {
+		return nil, err
+	}
+	var data daguapi.DAGSearchFeedResponse
+	switch result := resp.(type) {
+	case daguapi.SearchDAGFeed200JSONResponse:
+		data = daguapi.DAGSearchFeedResponse(result)
+	case *daguapi.SearchDAGFeed200JSONResponse:
+		data = daguapi.DAGSearchFeedResponse(*result)
+	default:
+		return nil, fmt.Errorf("unexpected DAG search response %T", resp)
+	}
+
+	items := make([]map[string]any, 0, len(data.Results))
+	for _, item := range data.Results {
+		name := item.FileName
+		if name == "" {
+			name = item.Name
+		}
+		entry := map[string]any{
+			"name":           name,
+			"uri":            dagSpecURI(name),
+			"matches":        item.Matches,
+			"hasMoreMatches": item.HasMoreMatches,
+		}
+		if item.Workspace != nil && *item.Workspace != "" {
+			entry["workspace"] = *item.Workspace
+		}
+		if item.NextMatchesCursor != nil && *item.NextMatchesCursor != "" {
+			entry["nextMatchesCursor"] = *item.NextMatchesCursor
+		}
+		items = append(items, entry)
+	}
+	output := map[string]any{
+		"results": items,
+		"hasMore": data.HasMore,
+	}
+	if data.NextCursor != nil && *data.NextCursor != "" {
+		output["nextCursor"] = *data.NextCursor
+	}
+	return output, nil
 }
 
 func (svc *Service) validateDAGSpec(ctx context.Context, name, spec string) (*daguapi.ValidateDAGSpec200JSONResponse, error) {
@@ -690,7 +619,7 @@ func (svc *Service) stopDAGRun(ctx context.Context, input executeInput) error {
 }
 
 func executeBody(input executeInput) *daguapi.ExecuteDAGJSONRequestBody {
-	body := &daguapi.ExecuteDAGJSONRequestBody{}
+	body := &daguapi.ExecuteDAGJSONRequestBody{DagName: stringPtr(input.Name)}
 	if input.DAGRunID != "" {
 		body.DagRunId = &input.DAGRunID
 	}
@@ -711,7 +640,7 @@ func executeBody(input executeInput) *daguapi.ExecuteDAGJSONRequestBody {
 }
 
 func enqueueBody(input executeInput) *daguapi.EnqueueDAGDAGRunJSONRequestBody {
-	body := &daguapi.EnqueueDAGDAGRunJSONRequestBody{}
+	body := &daguapi.EnqueueDAGDAGRunJSONRequestBody{DagName: stringPtr(input.Name)}
 	if input.DAGRunID != "" {
 		body.DagRunId = &input.DAGRunID
 	}
@@ -796,41 +725,59 @@ func (svc *Service) readResourceText(ctx context.Context, rawURI string) (string
 		if err != nil {
 			return "", "", err
 		}
-		text, err := prettyJSON(data)
+		text, err := jsonText(data)
 		if err != nil {
 			return "", "", err
 		}
 		return text, resourceMIMEJSON, nil
 	case "runs":
-		if !isRunResourceSegments(segments) && !isStepLogResourceSegments(segments) {
+		if !isRunResourceSegments(segments) && !isStepLogResourceSegments(segments) &&
+			!isSubRunResourceSegments(segments) && !isSubStepLogResourceSegments(segments) {
 			return "", "", mcpsdk.ResourceNotFoundError(rawURI)
 		}
-		if isStepLogResourceSegments(segments) && parsed.RawQuery != "" {
-			return "", "", mcpsdk.ResourceNotFoundError(rawURI)
+		if isStepLogResourceSegments(segments) || isSubStepLogResourceSegments(segments) {
+			if readErr := validateReadQuery(readTargetStepLog, parsed.RawQuery, true, rawURI); readErr != nil {
+				return "", "", mcpsdk.ResourceNotFoundError(rawURI)
+			}
 		}
 		if err := svc.requireAPI(); err != nil {
 			return "", "", err
 		}
 		identifier := segments[0] + "/" + segments[1]
 		var data any
-		if isStepLogResourceSegments(segments) {
+		switch {
+		case isStepLogResourceSegments(segments):
 			data, err = svc.api.GetStepLogDataByRef(
 				ctx,
 				ir.NewDAGRunRef(segments[0], segments[1]),
 				segments[3],
+				stepLogReadOptions(parsed.RawQuery),
 			)
-		} else if len(segments) == 3 {
+		case isSubStepLogResourceSegments(segments):
+			data, err = svc.api.GetSubStepLogDataByRef(
+				ctx,
+				ir.NewDAGRunRef(segments[0], segments[1]),
+				segments[3],
+				segments[5],
+				stepLogReadOptions(parsed.RawQuery),
+			)
+		case isSubRunResourceSegments(segments):
+			if parsed.RawQuery != "" {
+				return "", "", mcpsdk.ResourceNotFoundError(rawURI)
+			}
+			data, err = svc.api.GetSubDAGRunDetailsData(ctx, identifier+"/"+segments[3])
+		case len(segments) == 3:
 			if parsed.RawQuery != "" {
 				identifier += "?" + parsed.RawQuery
 			}
 			data, err = svc.api.GetDAGRunLogsData(ctx, identifier)
-		} else {
+		default:
 			data, err = svc.api.GetDAGRunDetailsData(ctx, identifier)
 		}
 		if err != nil {
 			return "", "", err
 		}
-		text, err := prettyJSON(data)
+		text, err := jsonText(data)
 		if err != nil {
 			return "", "", err
 		}
@@ -978,6 +925,14 @@ func isStepLogResourceSegments(segments []string) bool {
 	return len(segments) == 5 && segments[2] == "steps" && segments[4] == "logs"
 }
 
+func isSubRunResourceSegments(segments []string) bool {
+	return len(segments) == 4 && segments[2] == "sub"
+}
+
+func isSubStepLogResourceSegments(segments []string) bool {
+	return len(segments) == 7 && segments[2] == "sub" && segments[4] == "steps" && segments[6] == "logs"
+}
+
 func isTerminalStatus(status int) bool {
 	switch status {
 	case 2, 3, 4, 6, 8:
@@ -999,23 +954,6 @@ func requireName(name string) error {
 		return errors.New("name is required")
 	}
 	return nil
-}
-
-func requireRun(name, dagRunID string) error {
-	if err := requireName(name); err != nil {
-		return err
-	}
-	if strings.TrimSpace(dagRunID) == "" {
-		return errors.New("dagRunId is required")
-	}
-	return nil
-}
-
-func requireRetry(input executeInput) error {
-	if err := requireRun(input.Name, input.DAGRunID); err != nil {
-		return err
-	}
-	return requireIncludeDownstreamStep(input)
 }
 
 func requireIncludeDownstreamStep(input executeInput) error {
@@ -1090,6 +1028,14 @@ func runLogsURI(name, dagRunID string) string {
 	return runURI(name, dagRunID) + "/logs"
 }
 
+func subRunURI(name, dagRunID, subRunID string) string {
+	return runURI(name, dagRunID) + "/sub/" + pathEscape(subRunID)
+}
+
+func subStepLogURI(name, dagRunID, subRunID, stepName string) string {
+	return subRunURI(name, dagRunID, subRunID) + "/steps/" + pathEscape(stepName) + "/logs"
+}
+
 func runLogsURIWithQuery(name, dagRunID, query string) string {
 	uri := runLogsURI(name, dagRunID)
 	if query == "" {
@@ -1123,8 +1069,10 @@ func uriPathSegments(uri *url.URL) ([]string, error) {
 	return out, nil
 }
 
-func prettyJSON(v any) (string, error) {
-	data, err := json.MarshalIndent(v, "", "  ")
+// jsonText serializes resource content as compact JSON; indentation only
+// inflates payloads read by MCP clients.
+func jsonText(v any) (string, error) {
+	data, err := json.Marshal(v)
 	if err != nil {
 		return "", err
 	}

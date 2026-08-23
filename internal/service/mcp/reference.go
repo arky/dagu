@@ -16,7 +16,7 @@ Use dagu_read for current state, Wiki pages, and trusted reference resources.
 Use dagu_change with mode=preview before mode=apply when editing DAG YAML or Wiki pages.
 Use dagu_execute for start, enqueue, retry, and stop. retry and stop are actions inside dagu_execute.
 MCP Apps hosts can render run-related dagu_read and dagu_execute results in Dagu's interactive run inspector.
-After starting or enqueueing a run, read the returned dagu://runs/... resource or subscribe to it to receive a resource update notification when the run reaches a terminal state.`
+To follow a run to completion, pass wait=true to dagu_execute, or read the returned dagu://runs/... resource, or subscribe to it to receive a resource update notification when the run reaches a terminal state.`
 
 type referenceResource struct {
 	topic       string
@@ -124,17 +124,18 @@ Addressing:
 
 Fields:
 
-- target: required in target mode. Values are references, reference, dags, dag, dag_spec, wiki, wiki_page, wiki_search, runs, run, run_logs, and step_log.
+- target: required in target mode. Values are references, reference, dags, dag, dag_spec, dag_search, wiki, wiki_page, wiki_search, runs, run, run_logs, and step_log.
 - name: DAG name or reference topic name. Required for dag, dag_spec, run, run_logs, and step_log. Optional for reference; defaults to authoring. Forbidden for references, dags, and runs.
 - dagRunId: required for run, run_logs, and step_log. Forbidden for other targets.
+- subRunId: optional child DAG-run ID for run and step_log. The name and dagRunId fields identify its root run.
 - stepName: required for step_log. Forbidden for other targets.
-- query: URL query string without a leading question mark. Allowed for dags, wiki, runs, and run_logs.
-- workspace: all, default, or a workspace name. Optional for wiki and wiki_search; omitted means all accessible workspaces. Required for wiki_page, where all is not allowed.
+- query: URL query string without a leading question mark. Allowed for dags, wiki, runs, run_logs, and step_log.
+- workspace: all, default, or a workspace name. Optional for wiki, wiki_search, and dag_search; omitted means all accessible workspaces. Required for wiki_page, where all is not allowed.
 - path: Wiki page path without .md. Required for wiki_page.
-- search: search text. Required for wiki_search.
+- search: search text. Required for wiki_search and dag_search.
 - prefix: Wiki page path prefix without .md. Optional for wiki and wiki_search.
-- cursor: opaque cursor returned by wiki_search. Optional for wiki_search only.
-- limit: maximum number of results from 1 to 50. Optional for wiki_search; defaults to 20.
+- cursor: opaque cursor returned by the same search target. Optional for wiki_search and dag_search.
+- limit: maximum number of results from 1 to 50. Optional for wiki_search and dag_search; defaults to 20.
 - uri: dagu:// resource URI for URI mode.
 
 Targets:
@@ -144,27 +145,29 @@ Targets:
 - dags lists DAGs.
 - dag reads DAG details.
 - dag_spec reads the current DAG YAML.
+- dag_search searches DAG definition content and returns matching DAGs with line-level snippets. Continue with nextCursor while keeping search and workspace unchanged.
 - wiki lists the Wiki tree or a flat page list. In tree mode, page and perPage select direct children of the workspace or prefix, and each returned directory includes its descendants. In flat mode, they select individual pages.
 - wiki_page reads one Markdown Wiki page.
 - wiki_search searches accessible Wiki pages in stable path order. Continue with nextCursor while keeping search, workspace, and prefix unchanged.
-- docs, doc, and doc_search are deprecated aliases for the Wiki targets.
 - runs lists DAG-runs.
-- run reads one DAG-run.
+- run reads one DAG-run. With subRunId, it reads the child run under the identified root run.
 - run_logs reads scheduler and step log metadata.
-- step_log reads stdout and stderr for one DAG-run step.
+- step_log reads stdout and stderr for one DAG-run step. With subRunId, it reads a child-run step. Use the stream, tail, head, offset, and limit query parameters to bound the returned lines; without positioning parameters the last 1000 lines are returned.
 
 Query parameters:
 
 - dags: page, perPage, name, labels, active, sort, order.
 - wiki: page, perPage, flat, sort, order, prefix. perPage accepts 1 to 200.
 - runs: name, dagRunId, status, fromDate, toDate, limit, cursor, labels. status may repeat.
-- run_logs: tail.
+- run_logs: tail. Values from 1 to 10000 are honored.
+- step_log: tail, head, offset, limit, stream. tail, head, and limit accept 1 to 10000. Use at most one of tail, head, and offset; limit may be used alone or with offset. limit alone reads from the beginning of the log. stream is stdout or stderr; omitted means both.
 
 Output:
 
 - Successful result text is Dagu read completed.
 - For dags, the result text also includes the returned data as indented JSON after a blank line.
 - Structured output has target, data, references, and uri when the read has a canonical resource URI.
+- Child run and step-log URIs use dagu://runs/{name}/{dagRunId}/sub/{subRunId} under the root run address.
 - Reference URIs in references point to built-in guidance resources.
 - Wiki list and search entries include canonical dagu://wiki/{workspace}/{path} URIs. Nested page paths are encoded as one URI segment.
 - Wiki search output includes result snippets, modification times, hasMore, and nextCursor when another page is available.
@@ -175,7 +178,8 @@ Errors:
 - invalid_resource_uri for malformed URI-mode input.
 - unsupported_read_target for unknown target.
 - unsupported_resource for unknown dagu:// family.
-- resource_not_found, resource_unavailable, or internal_error for runtime failures.`,
+- resource_not_found, resource_unavailable, or internal_error for runtime failures.
+- A resource_not_found error for a misspelled DAG name carries close existing names under details.didYouMean.`,
 		},
 		{
 			topic:       "change-tool",
@@ -190,7 +194,7 @@ Purpose: validate or apply DAG definition and Markdown Wiki changes.
 Fields:
 
 - mode: preview or apply. Defaults to preview.
-- type: upsert_dag, rename_dag, delete_dag, upsert_wiki_page, rename_wiki_page, or delete_wiki_page. Defaults to upsert_dag. The upsert_doc, rename_doc, and delete_doc aliases are deprecated.
+- type: upsert_dag, rename_dag, delete_dag, upsert_wiki_page, rename_wiki_page, or delete_wiki_page. Defaults to upsert_dag.
 - name: DAG name. Required for DAG changes.
 - spec: complete DAG YAML. Required for upsert_dag.
 - newName: destination DAG name. Required for rename_dag.
@@ -218,7 +222,7 @@ Errors:
 
 - invalid_tool_input for missing or incompatible fields, invalid paths, unknown mode, unknown type, or malformed input.
 - unauthorized when the caller cannot perform the requested write.
-- resource_not_found when a rename or delete source does not exist.
+- resource_not_found when a rename or delete source does not exist. A misspelled DAG name carries close existing names under details.didYouMean.
 - conflict when a DAG rename destination exists or a Wiki path conflicts with another file or directory.
 - internal_error for unexpected failures.`,
 		},
@@ -236,16 +240,18 @@ Fields:
 
 - action: required. Values are start, enqueue, retry, and stop.
 - targetType: dag, inline_spec, or run. Defaults to run for retry and stop, inline_spec when spec is present, otherwise dag.
-- name: DAG name. Required for stored DAG runs and run actions.
-- spec: inline DAG YAML for targetType=inline_spec.
+- name: DAG name. Required for every action, including inline runs.
+- spec: inline DAG YAML for start or enqueue with targetType=inline_spec; otherwise invalid.
 - dagRunId: DAG-run identifier. Required for retry and stop. Optional override for start and enqueue.
-- params: run parameters string for start and enqueue.
+- params: run parameters for start and enqueue, as a JSON object or a JSON-encoded string.
 - queue: queue name for enqueue.
 - singleton: singleton run flag for start and enqueue.
 - noReuse: when true for start or enqueue, execute eligible build steps instead of reusing prior materializations.
 - labels: labels for start and enqueue.
 - stepName: optional step name for retry.
 - includeDownstream: when true, retry the selected step and every reachable descendant. Requires stepName.
+- wait: when true, wait for the identified run to reach a terminal state before returning. Requires a name that identifies the run.
+- waitTimeoutSeconds: maximum seconds to wait, from 1 to 300. Defaults to 60.
 
 Action behavior:
 
@@ -253,18 +259,22 @@ Action behavior:
 - enqueue enqueues a stored DAG or inline spec.
 - retry retries an existing DAG-run and may target a step with stepName, optionally including downstream steps.
 - stop stops an existing DAG-run.
+- Fields unsupported by an action are invalid. params, singleton, noReuse, and labels apply only to start and enqueue; queue only to enqueue; stepName and includeDownstream only to retry.
+- With wait=true, the call returns once the run reaches a terminal state or the timeout elapses. On timeout the run keeps executing and the output has completed=false.
 
 Output:
 
-- Successful result text is Dagu execute completed.
+- Successful result text begins with Dagu execute action completed.
 - Structured output has action, targetType, dagName, dagRunId, and references.
-- When a run is identified, output includes runUri, logsUri, and subscribe guidance.
+- When a run is identified, output includes runUri and logsUri. Without wait, it also includes subscribe guidance.
+- With wait=true, output has completed plus the last observed status and statusLabel, and a completed run includes the run detail summary under run with per-step statuses and errors.
 
 Errors:
 
 - invalid_tool_input for missing fields, unknown action, unsupported targetType, or malformed input.
 - unauthorized when the caller cannot perform the requested execution operation.
-- resource_not_found when the named DAG or DAG-run does not exist.
+- resource_not_found when the named DAG or DAG-run does not exist. A misspelled stored-DAG name carries close existing names under details.didYouMean.
+- conflict when a singleton run is already running or queued.
 - resource_unavailable or internal_error for runtime failures.`,
 		},
 		{
@@ -279,7 +289,7 @@ dagu_execute returns resource links for the DAG-run and logs when a run can be i
 
 Clients that support MCP resource subscriptions can subscribe to the dagu://runs/{name}/{dagRunId} resource. Dagu sends a resource update notification when the run reaches a terminal state: success, failed, aborted, partial success, or rejected.
 
-Clients without resource subscription support should poll dagu_read target=run with the same name and dagRunId.`,
+Clients without resource subscription support have two options: pass wait=true to dagu_execute to wait for the result inside the tool call, or poll dagu_read target=run with the same name and dagRunId.`,
 		},
 	}
 }

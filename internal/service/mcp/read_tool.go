@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	daguapi "github.com/dagucloud/dagu/v2/api/v1"
 	"github.com/dagucloud/dagu/v2/internal/dagrun"
@@ -27,6 +28,7 @@ const (
 	readTargetDAGs       = "dags"
 	readTargetDAG        = "dag"
 	readTargetDAGSpec    = "dag_spec"
+	readTargetDAGSearch  = "dag_search"
 	readTargetWiki       = "wiki"
 	readTargetWikiPage   = "wiki_page"
 	readTargetWikiSearch = "wiki_search"
@@ -50,6 +52,7 @@ const (
 	readFieldTarget    = "target"
 	readFieldName      = "name"
 	readFieldDAGRunID  = "dagRunId"
+	readFieldSubRunID  = "subRunId"
 	readFieldStepName  = "stepName"
 	readFieldQuery     = "query"
 	readFieldWorkspace = "workspace"
@@ -62,27 +65,28 @@ const (
 
 	readResourceScheme = "dagu"
 
-	readResourceReferenceCollectionURI  = "dagu://reference"
-	readResourceDAGsCollectionURI       = "dagu://dags"
-	readResourceWikiCollectionURI       = "dagu://wiki"
-	legacyReadResourceDocsCollectionURI = "dagu://docs"
-	readResourceRunsCollectionURI       = "dagu://runs"
+	readResourceReferenceCollectionURI = "dagu://reference"
+	readResourceDAGsCollectionURI      = "dagu://dags"
+	readResourceWikiCollectionURI      = "dagu://wiki"
+	readResourceRunsCollectionURI      = "dagu://runs"
 
 	readWikiSearchMaxLimit = 50
+	readLogMaxLines        = 10000
 )
 
 type readInput struct {
-	Target    string `json:"target" jsonschema:"Read target: dags, dag, dag_spec, wiki, wiki_page, wiki_search, runs, run, run_logs, step_log, or reference."`
+	Target    string `json:"target" jsonschema:"Read target: dags, dag, dag_spec, dag_search, wiki, wiki_page, wiki_search, runs, run, run_logs, step_log, or reference."`
 	Name      string `json:"name,omitempty" jsonschema:"DAG name for dag, dag_spec, run, run_logs, and step_log targets."`
 	DAGRunID  string `json:"dagRunId,omitempty" jsonschema:"DAG-run ID for run, run_logs, and step_log targets. The value latest is accepted where Dagu accepts it."`
+	SubRunID  string `json:"subRunId,omitempty" jsonschema:"Child DAG-run ID for run and step_log targets, addressed under the root run identified by name and dagRunId."`
 	StepName  string `json:"stepName,omitempty" jsonschema:"Step name for the step_log target."`
 	Query     string `json:"query,omitempty" jsonschema:"URL query string for list targets, for example page=1&perPage=100 or status=running."`
-	Workspace string `json:"workspace,omitempty" jsonschema:"Wiki workspace: all, default, or a workspace name. Required for wiki_page and optional for wiki and wiki_search."`
+	Workspace string `json:"workspace,omitempty" jsonschema:"Workspace: all, default, or a workspace name. Required for wiki_page and optional for wiki, wiki_search, and dag_search."`
 	Path      string `json:"path,omitempty" jsonschema:"Wiki page path without the .md extension. Required for wiki_page."`
-	Search    string `json:"search,omitempty" jsonschema:"Wiki search text. Required for wiki_search."`
+	Search    string `json:"search,omitempty" jsonschema:"Search text. Required for wiki_search and dag_search."`
 	Prefix    string `json:"prefix,omitempty" jsonschema:"Wiki page path prefix. Optional for wiki and wiki_search."`
-	Cursor    string `json:"cursor,omitempty" jsonschema:"Opaque cursor returned by wiki_search."`
-	Limit     int    `json:"limit,omitempty" jsonschema:"Maximum wiki_search results to return, from 1 to 50."`
+	Cursor    string `json:"cursor,omitempty" jsonschema:"Opaque cursor returned by wiki_search or dag_search."`
+	Limit     int    `json:"limit,omitempty" jsonschema:"Maximum search results to return, from 1 to 50."`
 	URI       string `json:"uri,omitempty" jsonschema:"Resource URI to read directly, for example dagu://reference/authoring."`
 }
 
@@ -92,7 +96,8 @@ func readToolInputSchema() json.RawMessage {
 		"properties": {
 			"target": {
 				"type": "string",
-				"description": "Read target: references, reference, dags, dag, dag_spec, wiki, wiki_page, wiki_search, runs, run, run_logs, or step_log. The docs, doc, and doc_search aliases are deprecated."
+				"enum": ["references", "reference", "dags", "dag", "dag_spec", "dag_search", "wiki", "wiki_page", "wiki_search", "runs", "run", "run_logs", "step_log"],
+				"description": "Read target."
 			},
 			"name": {
 				"type": "string",
@@ -102,17 +107,21 @@ func readToolInputSchema() json.RawMessage {
 				"type": "string",
 				"description": "DAG-run identifier for run, run_logs, and step_log targets."
 			},
+			"subRunId": {
+				"type": "string",
+				"description": "Child DAG-run ID for run and step_log targets. Reads the child run addressed under the root run identified by name and dagRunId."
+			},
 			"stepName": {
 				"type": "string",
 				"description": "Step name for the step_log target."
 			},
 			"query": {
 				"type": "string",
-				"description": "URL query string without a leading question mark."
+				"description": "URL query string without a leading question mark. Allowed for dags, wiki, runs, run_logs (tail), and step_log (tail, head, offset, limit, stream)."
 			},
 			"workspace": {
 				"type": "string",
-				"description": "Wiki workspace: all, default, or a workspace name. Required for wiki_page and optional for wiki and wiki_search."
+				"description": "Workspace: all, default, or a workspace name. Required for wiki_page and optional for wiki, wiki_search, and dag_search."
 			},
 			"path": {
 				"type": "string",
@@ -120,7 +129,7 @@ func readToolInputSchema() json.RawMessage {
 			},
 			"search": {
 				"type": "string",
-				"description": "Wiki search text. Required for wiki_search."
+				"description": "Search text. Required for wiki_search and dag_search."
 			},
 			"prefix": {
 				"type": "string",
@@ -128,13 +137,13 @@ func readToolInputSchema() json.RawMessage {
 			},
 			"cursor": {
 				"type": "string",
-				"description": "Opaque cursor returned by wiki_search."
+				"description": "Opaque cursor returned by wiki_search or dag_search."
 			},
 			"limit": {
 				"type": "integer",
 				"minimum": 1,
 				"maximum": 50,
-				"description": "Maximum number of wiki_search results to return."
+				"description": "Maximum number of wiki_search or dag_search results to return."
 			},
 			"uri": {
 				"type": "string",
@@ -175,7 +184,11 @@ func (svc *Service) readTool(ctx context.Context, req *mcpsdk.CallToolRequest) (
 		return svc.readToolImpl(ctx, input)
 	})
 	if err != nil {
-		return readErrorResult(classifyReadToolError(input, err)), nil
+		readErr := classifyReadToolError(input, err)
+		if readErr.Details == nil && isDAGNotFound(err) {
+			readErr.Details = svc.didYouMeanDetails(ctx, input.Name)
+		}
+		return readErrorResult(readErr), nil
 	}
 	result.StructuredContent = output
 	return result, nil
@@ -220,6 +233,10 @@ func (svc *Service) readToolImpl(ctx context.Context, input readInput) (*mcpsdk.
 				data = normalizeDAGSpec(raw, input.Name)
 			}
 		}
+	case readTargetDAGSearch:
+		if err = svc.requireAPI(); err == nil {
+			data, err = svc.searchDAGs(ctx, input.Workspace, input.Search, input.Cursor, input.Limit)
+		}
 	case readTargetWiki:
 		if err = svc.requireAPI(); err == nil {
 			data, err = svc.listWikiPages(ctx, input.Workspace, input.Query)
@@ -247,9 +264,14 @@ func (svc *Service) readToolImpl(ctx context.Context, input readInput) (*mcpsdk.
 	case readTargetRun:
 		if err = svc.requireAPI(); err == nil {
 			var raw any
-			raw, err = svc.api.GetDAGRunDetailsData(ctx, input.Name+"/"+input.DAGRunID)
+			addr := runAddress{name: input.Name, dagRunID: input.DAGRunID, subRunID: input.SubRunID}
+			if input.SubRunID != "" {
+				raw, err = svc.api.GetSubDAGRunDetailsData(ctx, input.Name+"/"+input.DAGRunID+"/"+input.SubRunID)
+			} else {
+				raw, err = svc.api.GetDAGRunDetailsData(ctx, input.Name+"/"+input.DAGRunID)
+			}
 			if err == nil {
-				data, err = normalizeRunDetails(raw, input.Name, input.DAGRunID)
+				data, err = normalizeRunDetails(raw, addr)
 			}
 		}
 	case readTargetRunLogs:
@@ -262,11 +284,22 @@ func (svc *Service) readToolImpl(ctx context.Context, input readInput) (*mcpsdk.
 		}
 	case readTargetStepLog:
 		if err = svc.requireAPI(); err == nil {
-			data, err = svc.api.GetStepLogDataByRef(
-				ctx,
-				ir.NewDAGRunRef(input.Name, input.DAGRunID),
-				input.StepName,
-			)
+			if input.SubRunID != "" {
+				data, err = svc.api.GetSubStepLogDataByRef(
+					ctx,
+					ir.NewDAGRunRef(input.Name, input.DAGRunID),
+					input.SubRunID,
+					input.StepName,
+					stepLogReadOptions(input.Query),
+				)
+			} else {
+				data, err = svc.api.GetStepLogDataByRef(
+					ctx,
+					ir.NewDAGRunRef(input.Name, input.DAGRunID),
+					input.StepName,
+					stepLogReadOptions(input.Query),
+				)
+			}
 		}
 	default:
 		return nil, nil, unsupportedReadTargetError(input.Target)
@@ -284,6 +317,9 @@ func (svc *Service) readToolImpl(ctx context.Context, input readInput) (*mcpsdk.
 		output["name"] = input.Name
 		output["dagRunId"] = input.DAGRunID
 		output["stepName"] = input.StepName
+		if input.SubRunID != "" {
+			output["subRunId"] = input.SubRunID
+		}
 	}
 	if input.Workspace != "" {
 		output["workspace"] = input.Workspace
@@ -367,6 +403,7 @@ func parseReadToolInput(raw json.RawMessage) (readInput, *readToolError) {
 			readFieldTarget,
 			readFieldName,
 			readFieldDAGRunID,
+			readFieldSubRunID,
 			readFieldStepName,
 			readFieldQuery,
 			readFieldWorkspace,
@@ -410,6 +447,7 @@ func parseReadToolInput(raw json.RawMessage) (readInput, *readToolError) {
 		Target:    target,
 		Name:      values[readFieldName],
 		DAGRunID:  values[readFieldDAGRunID],
+		SubRunID:  values[readFieldSubRunID],
 		StepName:  values[readFieldStepName],
 		Query:     values[readFieldQuery],
 		Workspace: values[readFieldWorkspace],
@@ -430,6 +468,7 @@ func isReadInputField(field string) bool {
 	case readFieldTarget,
 		readFieldName,
 		readFieldDAGRunID,
+		readFieldSubRunID,
 		readFieldStepName,
 		readFieldQuery,
 		readFieldWorkspace,
@@ -585,15 +624,40 @@ func parseReadResourceURI(rawURI string) (readInput, *readToolError) {
 				URI:      runLogsURIWithQuery(resource.segments[0], resource.segments[1], resource.query),
 			}, nil
 		case len(resource.segments) == 5 && resource.segments[2] == "steps" && resource.segments[4] == "logs":
-			if resource.query != "" {
-				return readInput{}, invalidResourceURI(rawURI, "Step log resources do not support query parameters.")
+			if err := validateReadQuery(readTargetStepLog, resource.query, true, rawURI); err != nil {
+				return readInput{}, err
 			}
 			return readInput{
 				Target:   readTargetStepLog,
 				Name:     resource.segments[0],
 				DAGRunID: resource.segments[1],
 				StepName: resource.segments[3],
-				URI:      stepLogURI(resource.segments[0], resource.segments[1], resource.segments[3]),
+				Query:    resource.query,
+				URI:      uriWithQuery(stepLogURI(resource.segments[0], resource.segments[1], resource.segments[3]), resource.query),
+			}, nil
+		case isSubRunResourceSegments(resource.segments):
+			if resource.query != "" {
+				return readInput{}, invalidResourceURI(rawURI, "Sub DAG-run resources do not support query parameters.")
+			}
+			return readInput{
+				Target:   readTargetRun,
+				Name:     resource.segments[0],
+				DAGRunID: resource.segments[1],
+				SubRunID: resource.segments[3],
+				URI:      subRunURI(resource.segments[0], resource.segments[1], resource.segments[3]),
+			}, nil
+		case isSubStepLogResourceSegments(resource.segments):
+			if err := validateReadQuery(readTargetStepLog, resource.query, true, rawURI); err != nil {
+				return readInput{}, err
+			}
+			return readInput{
+				Target:   readTargetStepLog,
+				Name:     resource.segments[0],
+				DAGRunID: resource.segments[1],
+				SubRunID: resource.segments[3],
+				StepName: resource.segments[5],
+				Query:    resource.query,
+				URI:      uriWithQuery(subStepLogURI(resource.segments[0], resource.segments[1], resource.segments[3], resource.segments[5]), resource.query),
 			}, nil
 		default:
 			return readInput{}, invalidResourceURI(rawURI, "Unsupported DAG-run resource path.")
@@ -628,23 +692,28 @@ func validateTargetReadInput(input *readInput) *readToolError {
 	if input.StepName != "" && input.Target != readTargetStepLog {
 		return invalidTargetField(input.Target, readFieldStepName)
 	}
-	wikiTarget := input.Target == readTargetWiki || input.Target == readTargetWikiPage || input.Target == readTargetWikiSearch
-	if input.Workspace != "" && !wikiTarget {
+	if input.SubRunID != "" && input.Target != readTargetRun && input.Target != readTargetStepLog {
+		return invalidTargetField(input.Target, readFieldSubRunID)
+	}
+	workspaceTarget := input.Target == readTargetWiki || input.Target == readTargetWikiPage ||
+		input.Target == readTargetWikiSearch || input.Target == readTargetDAGSearch
+	searchTarget := input.Target == readTargetWikiSearch || input.Target == readTargetDAGSearch
+	if input.Workspace != "" && !workspaceTarget {
 		return invalidTargetField(input.Target, readFieldWorkspace)
 	}
 	if input.Path != "" && input.Target != readTargetWikiPage {
 		return invalidTargetField(input.Target, readFieldPath)
 	}
-	if input.Search != "" && input.Target != readTargetWikiSearch {
+	if input.Search != "" && !searchTarget {
 		return invalidTargetField(input.Target, readFieldSearch)
 	}
 	if input.Prefix != "" && input.Target != readTargetWiki && input.Target != readTargetWikiSearch {
 		return invalidTargetField(input.Target, readFieldPrefix)
 	}
-	if input.Cursor != "" && input.Target != readTargetWikiSearch {
+	if input.Cursor != "" && !searchTarget {
 		return invalidTargetField(input.Target, readFieldCursor)
 	}
-	if input.Limit != 0 && input.Target != readTargetWikiSearch {
+	if input.Limit != 0 && !searchTarget {
 		return invalidTargetField(input.Target, readFieldLimit)
 	}
 	if input.Prefix != "" {
@@ -705,6 +774,22 @@ func validateTargetReadInput(input *readInput) *readToolError {
 			return invalidTargetField(input.Target, readFieldQuery)
 		}
 		input.URI = dagSpecURI(input.Name)
+	case readTargetDAGSearch:
+		if input.Name != "" {
+			return invalidTargetField(input.Target, readFieldName)
+		}
+		if input.DAGRunID != "" {
+			return invalidTargetField(input.Target, readFieldDAGRunID)
+		}
+		if input.Query != "" {
+			return invalidTargetField(input.Target, readFieldQuery)
+		}
+		if input.Workspace == "" {
+			input.Workspace = "all"
+		}
+		if input.Search == "" {
+			return missingTargetField(input.Target, readFieldSearch)
+		}
 	case readTargetWiki:
 		if input.Name != "" {
 			return invalidTargetField(input.Target, readFieldName)
@@ -789,7 +874,11 @@ func validateTargetReadInput(input *readInput) *readToolError {
 		if input.Query != "" {
 			return invalidTargetField(input.Target, readFieldQuery)
 		}
-		input.URI = runURI(input.Name, input.DAGRunID)
+		if input.SubRunID != "" {
+			input.URI = subRunURI(input.Name, input.DAGRunID, input.SubRunID)
+		} else {
+			input.URI = runURI(input.Name, input.DAGRunID)
+		}
 	case readTargetRunLogs:
 		if input.Name == "" {
 			return missingTargetField(input.Target, readFieldName)
@@ -811,10 +900,14 @@ func validateTargetReadInput(input *readInput) *readToolError {
 		if input.StepName == "" {
 			return missingTargetField(input.Target, readFieldStepName)
 		}
-		if input.Query != "" {
-			return invalidTargetField(input.Target, readFieldQuery)
+		if err := validateReadQuery(input.Target, input.Query, false, ""); err != nil {
+			return err
 		}
-		input.URI = stepLogURI(input.Name, input.DAGRunID, input.StepName)
+		if input.SubRunID != "" {
+			input.URI = uriWithQuery(subStepLogURI(input.Name, input.DAGRunID, input.SubRunID, input.StepName), input.Query)
+		} else {
+			input.URI = uriWithQuery(stepLogURI(input.Name, input.DAGRunID, input.StepName), input.Query)
+		}
 	default:
 		return unsupportedReadTargetError(input.Target)
 	}
@@ -833,6 +926,17 @@ func validateReadQuery(target, rawQuery string, uriMode bool, rawURI string) *re
 	values, err := url.ParseQuery(rawQuery)
 	if err != nil {
 		return readQueryError(target, uriMode, rawURI, "Query contains malformed URL encoding.")
+	}
+	if target == readTargetStepLog {
+		positioning := 0
+		for _, key := range []string{"tail", "head", "offset"} {
+			if values.Has(key) {
+				positioning++
+			}
+		}
+		if positioning > 1 || (values.Has("limit") && (values.Has("tail") || values.Has("head"))) {
+			return readQueryError(target, uriMode, rawURI, "Use only one step log positioning mode; limit may be used alone or with offset.")
+		}
 	}
 
 	for key, rawValues := range values {
@@ -875,6 +979,11 @@ func isAllowedReadQueryParam(target, key string) bool {
 	case readTargetRunLogs:
 		switch key {
 		case "tail":
+			return true
+		}
+	case readTargetStepLog:
+		switch key {
+		case "tail", "head", "offset", "limit", "stream":
 			return true
 		}
 	}
@@ -932,10 +1041,43 @@ func validReadQueryValue(target, key, value string) bool {
 	case readTargetRunLogs:
 		switch key {
 		case "tail":
+			return validIntRange(value, 1, readLogMaxLines)
+		}
+	case readTargetStepLog:
+		switch key {
+		case "tail", "head", "limit":
+			return validIntRange(value, 1, readLogMaxLines)
+		case "offset":
 			return validIntRange(value, 1, 0)
+		case "stream":
+			return value == "stdout" || value == "stderr"
 		}
 	}
 	return false
+}
+
+// stepLogReadOptions maps a validated step_log query string onto step log
+// read options. Values were already range-checked, so parse failures are
+// treated as absent.
+func stepLogReadOptions(rawQuery string) frontendapi.StepLogReadOptions {
+	values, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return frontendapi.StepLogReadOptions{}
+	}
+	intValue := func(key string) int {
+		n, err := strconv.Atoi(values.Get(key))
+		if err != nil || n < 0 {
+			return 0
+		}
+		return n
+	}
+	return frontendapi.StepLogReadOptions{
+		Tail:   intValue("tail"),
+		Head:   intValue("head"),
+		Offset: intValue("offset"),
+		Limit:  intValue("limit"),
+		Stream: values.Get("stream"),
+	}
 }
 
 func validIntRange(value string, minValue, maxValue int) bool {
@@ -971,49 +1113,186 @@ func readReferenceCollection() map[string]any {
 }
 
 func normalizeDAGList(raw any) (map[string]any, error) {
-	var dags []daguapi.DAGFile
+	var resp daguapi.ListDAGs200JSONResponse
 	switch data := raw.(type) {
 	case daguapi.ListDAGs200JSONResponse:
-		dags = data.Dags
+		resp = data
 	case *daguapi.ListDAGs200JSONResponse:
-		dags = data.Dags
+		resp = *data
 	default:
 		return nil, fmt.Errorf("unexpected DAG list response %T", raw)
 	}
 
-	items := make([]map[string]any, 0, len(dags))
-	for _, dag := range dags {
+	items := make([]map[string]any, 0, len(resp.Dags))
+	for _, dag := range resp.Dags {
 		name := dag.FileName
 		if name == "" {
 			name = dag.Dag.Name
 		}
-		items = append(items, map[string]any{
-			"name": name,
-			"uri":  dagSpecURI(name),
-		})
+		item := map[string]any{
+			"name":      name,
+			"uri":       dagSpecURI(name),
+			"suspended": dag.Suspended,
+		}
+		if dag.Dag.Description != nil && *dag.Dag.Description != "" {
+			item["description"] = *dag.Dag.Description
+		}
+		if schedules := scheduleStrings(dag.Dag.Schedule); len(schedules) > 0 {
+			item["schedule"] = schedules
+		}
+		if dag.Dag.Labels != nil && len(*dag.Dag.Labels) > 0 {
+			item["labels"] = *dag.Dag.Labels
+		}
+		if dag.NextRun != nil {
+			item["nextRun"] = dag.NextRun.Format(time.RFC3339)
+		}
+		if latest := runSummaryEntry(
+			name,
+			string(dag.LatestDAGRun.DagRunId),
+			dag.LatestDAGRun.Status,
+			string(dag.LatestDAGRun.StatusLabel),
+			dag.LatestDAGRun.StartedAt,
+			dag.LatestDAGRun.FinishedAt,
+		); latest != nil {
+			item["latestRun"] = latest
+		}
+		if len(dag.Errors) > 0 {
+			item["errors"] = dag.Errors
+		}
+		items = append(items, item)
 	}
-	return map[string]any{"items": items}, nil
+	out := map[string]any{
+		"items":      items,
+		"pagination": resp.Pagination,
+	}
+	if len(resp.Errors) > 0 {
+		out["errors"] = resp.Errors
+	}
+	return out, nil
 }
 
 func normalizeDAGDetails(raw any, fallbackName string) (map[string]any, error) {
-	var dag *daguapi.DAGDetails
+	var resp daguapi.GetDAGDetails200JSONResponse
 	switch data := raw.(type) {
 	case daguapi.GetDAGDetails200JSONResponse:
-		dag = data.Dag
+		resp = data
 	case *daguapi.GetDAGDetails200JSONResponse:
-		dag = data.Dag
+		resp = *data
 	default:
 		return nil, fmt.Errorf("unexpected DAG details response %T", raw)
 	}
 
+	dag := resp.Dag
 	name := fallbackName
 	if dag != nil && dag.Name != "" {
 		name = dag.Name
 	}
-	return map[string]any{
-		"name":    name,
-		"specUri": dagSpecURI(name),
-	}, nil
+	out := map[string]any{
+		"name":      name,
+		"specUri":   dagSpecURI(name),
+		"suspended": resp.Suspended,
+	}
+	if dag != nil {
+		if dag.Description != nil && *dag.Description != "" {
+			out["description"] = *dag.Description
+		}
+		if schedules := scheduleStrings(dag.Schedule); len(schedules) > 0 {
+			out["schedule"] = schedules
+		}
+		if dag.Labels != nil && len(*dag.Labels) > 0 {
+			out["labels"] = *dag.Labels
+		}
+		if dag.Group != nil && *dag.Group != "" {
+			out["group"] = *dag.Group
+		}
+		if dag.Queue != nil && *dag.Queue != "" {
+			out["queue"] = *dag.Queue
+		}
+		if dag.Params != nil && len(*dag.Params) > 0 {
+			out["params"] = *dag.Params
+		}
+		if dag.DefaultParams != nil && *dag.DefaultParams != "" {
+			out["defaultParams"] = *dag.DefaultParams
+		}
+		if dag.NextRun != nil {
+			out["nextRun"] = dag.NextRun.Format(time.RFC3339)
+		}
+		if dag.Steps != nil && len(*dag.Steps) > 0 {
+			steps := make([]map[string]any, 0, len(*dag.Steps))
+			for _, step := range *dag.Steps {
+				entry := map[string]any{"name": step.Name}
+				if step.Id != nil && *step.Id != "" {
+					entry["id"] = *step.Id
+				}
+				if step.Description != nil && *step.Description != "" {
+					entry["description"] = *step.Description
+				}
+				steps = append(steps, entry)
+			}
+			out["steps"] = steps
+		}
+	}
+	if latest := runSummaryEntry(
+		name,
+		string(resp.LatestDAGRun.DagRunId),
+		resp.LatestDAGRun.Status,
+		string(resp.LatestDAGRun.StatusLabel),
+		resp.LatestDAGRun.StartedAt,
+		resp.LatestDAGRun.FinishedAt,
+	); latest != nil {
+		out["latestRun"] = latest
+	}
+	if len(resp.Errors) > 0 {
+		out["errors"] = resp.Errors
+	}
+	return out, nil
+}
+
+// scheduleStrings flattens API schedule entries into cron expressions and
+// RFC 3339 one-off timestamps.
+func scheduleStrings(schedules *[]daguapi.Schedule) []string {
+	if schedules == nil {
+		return nil
+	}
+	out := make([]string, 0, len(*schedules))
+	for _, schedule := range *schedules {
+		switch {
+		case schedule.Expression != "":
+			out = append(out, schedule.Expression)
+		case schedule.At != nil:
+			out = append(out, schedule.At.Format(time.RFC3339))
+		}
+	}
+	return out
+}
+
+// runSummaryEntry returns a compact DAG-run reference, or nil when the source
+// has no run ID (for example a DAG that has never run).
+func runSummaryEntry(name, dagRunID string, status any, statusLabel, startedAt, finishedAt string) map[string]any {
+	if dagRunID == "" {
+		return nil
+	}
+	entry := map[string]any{
+		"dagRunId":    dagRunID,
+		"status":      status,
+		"statusLabel": statusLabel,
+	}
+	if name != "" {
+		entry["uri"] = runURI(name, dagRunID)
+	}
+	if isSetTimestamp(startedAt) {
+		entry["startedAt"] = startedAt
+	}
+	if isSetTimestamp(finishedAt) {
+		entry["finishedAt"] = finishedAt
+	}
+	return entry
+}
+
+// isSetTimestamp reports whether a serialized run timestamp holds a value;
+// unset timestamps are stored as an empty string or the "-" placeholder.
+func isSetTimestamp(value string) bool {
+	return value != "" && value != "-"
 }
 
 func normalizeDAGSpec(raw map[string]any, name string) map[string]any {
@@ -1038,63 +1317,237 @@ func normalizeDAGSpec(raw map[string]any, name string) map[string]any {
 }
 
 func normalizeRunList(raw any) (map[string]any, error) {
-	var runs []daguapi.DAGRunSummary
+	var page daguapi.DAGRunsPageResponse
 	switch data := raw.(type) {
 	case daguapi.DAGRunsPageResponse:
-		runs = data.DagRuns
+		page = data
 	case *daguapi.DAGRunsPageResponse:
-		runs = data.DagRuns
+		page = *data
 	case daguapi.ListDAGRuns200JSONResponse:
-		page := daguapi.DAGRunsPageResponse(data)
-		runs = page.DagRuns
+		page = daguapi.DAGRunsPageResponse(data)
 	case *daguapi.ListDAGRuns200JSONResponse:
-		page := daguapi.DAGRunsPageResponse(*data)
-		runs = page.DagRuns
+		page = daguapi.DAGRunsPageResponse(*data)
 	default:
 		return nil, fmt.Errorf("unexpected DAG-run list response %T", raw)
 	}
 
-	items := make([]map[string]any, 0, len(runs))
-	for _, run := range runs {
+	items := make([]map[string]any, 0, len(page.DagRuns))
+	for _, run := range page.DagRuns {
 		name := string(run.Name)
 		dagRunID := string(run.DagRunId)
-		items = append(items, map[string]any{
+		item := map[string]any{
 			"name":        name,
 			"dagRunId":    dagRunID,
 			"uri":         runURI(name, dagRunID),
 			"status":      run.Status,
 			"statusLabel": run.StatusLabel,
-		})
+		}
+		if isSetTimestamp(run.StartedAt) {
+			item["startedAt"] = run.StartedAt
+		}
+		if isSetTimestamp(run.FinishedAt) {
+			item["finishedAt"] = run.FinishedAt
+		}
+		if run.QueuedAt != nil && isSetTimestamp(*run.QueuedAt) {
+			item["queuedAt"] = *run.QueuedAt
+		}
+		if run.Labels != nil && len(*run.Labels) > 0 {
+			item["labels"] = *run.Labels
+		}
+		items = append(items, item)
 	}
-	return map[string]any{"items": items}, nil
+	out := map[string]any{"items": items}
+	if page.NextCursor != nil && *page.NextCursor != "" {
+		out["nextCursor"] = *page.NextCursor
+	}
+	return out, nil
 }
 
-func normalizeRunDetails(raw any, fallbackName, fallbackDAGRunID string) (map[string]any, error) {
-	var run daguapi.DAGRunDetails
-	switch data := raw.(type) {
-	case daguapi.GetDAGRunDetails200JSONResponse:
-		run = data.DagRunDetails
-	case *daguapi.GetDAGRunDetails200JSONResponse:
-		run = data.DagRunDetails
-	default:
-		return nil, fmt.Errorf("unexpected DAG-run details response %T", raw)
+// runAddress identifies how a DAG-run is addressed through MCP resources: a
+// root run by name and run ID, or a child run by root reference plus child
+// run ID.
+type runAddress struct {
+	name     string
+	dagRunID string
+	subRunID string
+}
+
+func (a runAddress) uri() string {
+	if a.subRunID == "" {
+		return runURI(a.name, a.dagRunID)
+	}
+	return subRunURI(a.name, a.dagRunID, a.subRunID)
+}
+
+func (a runAddress) stepLogURI(stepName string) string {
+	if a.subRunID == "" {
+		return stepLogURI(a.name, a.dagRunID, stepName)
+	}
+	return subStepLogURI(a.name, a.dagRunID, a.subRunID, stepName)
+}
+
+// subRunAddress addresses a child run under the same root as this address.
+func (a runAddress) subRunAddress(subRunID string) runAddress {
+	return runAddress{name: a.name, dagRunID: a.dagRunID, subRunID: subRunID}
+}
+
+func normalizeRunDetails(raw any, addr runAddress) (map[string]any, error) {
+	run, err := dagRunDetailsFromResponse(raw)
+	if err != nil {
+		return nil, err
 	}
 
+	// Canonicalize the address with the resolved run identity so returned
+	// URIs use concrete IDs even when the request used an alias.
 	name := string(run.Name)
-	if name == "" {
-		name = fallbackName
-	}
 	dagRunID := string(run.DagRunId)
-	if dagRunID == "" {
-		dagRunID = fallbackDAGRunID
+	if addr.subRunID == "" {
+		if name == "" {
+			name = addr.name
+		}
+		if dagRunID == "" {
+			dagRunID = addr.dagRunID
+		}
+		addr.name, addr.dagRunID = name, dagRunID
+	} else if dagRunID != "" {
+		addr.subRunID = dagRunID
 	}
-	return map[string]any{
+
+	out := map[string]any{
 		"name":        name,
 		"dagRunId":    dagRunID,
-		"uri":         runURI(name, dagRunID),
+		"uri":         addr.uri(),
 		"status":      run.Status,
 		"statusLabel": run.StatusLabel,
-	}, nil
+		"steps":       runStepEntries(addr, run.Nodes),
+	}
+	if addr.subRunID == "" {
+		out["logsUri"] = runLogsURI(addr.name, addr.dagRunID)
+	}
+	if isSetTimestamp(run.StartedAt) {
+		out["startedAt"] = run.StartedAt
+	}
+	if isSetTimestamp(run.FinishedAt) {
+		out["finishedAt"] = run.FinishedAt
+	}
+	if run.QueuedAt != nil && isSetTimestamp(*run.QueuedAt) {
+		out["queuedAt"] = *run.QueuedAt
+	}
+	if run.Params != nil && *run.Params != "" {
+		out["params"] = *run.Params
+	}
+	if run.Labels != nil && len(*run.Labels) > 0 {
+		out["labels"] = *run.Labels
+	}
+	if run.RootDAGRunId != "" && run.RootDAGRunId != dagRunID {
+		rootRun := map[string]any{
+			"name":     run.RootDAGRunName,
+			"dagRunId": run.RootDAGRunId,
+		}
+		if run.RootDAGRunName != "" {
+			rootRun["uri"] = runURI(run.RootDAGRunName, run.RootDAGRunId)
+		}
+		out["rootRun"] = rootRun
+	}
+	if run.ParentDAGRunId != nil && *run.ParentDAGRunId != "" {
+		parent := map[string]any{"dagRunId": *run.ParentDAGRunId}
+		if run.ParentDAGRunName != nil && *run.ParentDAGRunName != "" {
+			parent["name"] = *run.ParentDAGRunName
+		}
+		out["parentRun"] = parent
+	}
+	if run.Conditions != nil && len(*run.Conditions) > 0 {
+		out["conditions"] = *run.Conditions
+	}
+	if handlers := runHandlerEntries(addr, run); len(handlers) > 0 {
+		out["handlers"] = handlers
+	}
+	return out, nil
+}
+
+func dagRunDetailsFromResponse(raw any) (daguapi.DAGRunDetails, error) {
+	switch data := raw.(type) {
+	case daguapi.GetDAGRunDetails200JSONResponse:
+		return data.DagRunDetails, nil
+	case *daguapi.GetDAGRunDetails200JSONResponse:
+		return data.DagRunDetails, nil
+	case daguapi.GetSubDAGRunDetails200JSONResponse:
+		return data.DagRunDetails, nil
+	case *daguapi.GetSubDAGRunDetails200JSONResponse:
+		return data.DagRunDetails, nil
+	default:
+		return daguapi.DAGRunDetails{}, fmt.Errorf("unexpected DAG-run details response %T", raw)
+	}
+}
+
+func runStepEntries(addr runAddress, nodes []daguapi.Node) []map[string]any {
+	steps := make([]map[string]any, 0, len(nodes))
+	for _, node := range nodes {
+		steps = append(steps, runStepEntry(addr, node))
+	}
+	return steps
+}
+
+func runStepEntry(addr runAddress, node daguapi.Node) map[string]any {
+	entry := map[string]any{
+		"name":        node.Step.Name,
+		"status":      node.Status,
+		"statusLabel": node.StatusLabel,
+		"logUri":      addr.stepLogURI(node.Step.Name),
+	}
+	if node.Step.Id != nil && *node.Step.Id != "" {
+		entry["id"] = *node.Step.Id
+	}
+	if isSetTimestamp(node.StartedAt) {
+		entry["startedAt"] = node.StartedAt
+	}
+	if isSetTimestamp(node.FinishedAt) {
+		entry["finishedAt"] = node.FinishedAt
+	}
+	if node.Error != nil && *node.Error != "" {
+		entry["error"] = *node.Error
+	}
+	if node.RetryCount > 0 {
+		entry["retryCount"] = node.RetryCount
+	}
+	var subRuns []map[string]any
+	for _, runs := range []*[]daguapi.SubDAGRun{node.SubRuns, node.SubRunsRepeated} {
+		if runs == nil {
+			continue
+		}
+		for _, subRun := range *runs {
+			ref := map[string]any{
+				"dagRunId": string(subRun.DagRunId),
+				"uri":      addr.subRunAddress(string(subRun.DagRunId)).uri(),
+			}
+			if subRun.DagName != nil && *subRun.DagName != "" {
+				ref["dagName"] = *subRun.DagName
+			}
+			subRuns = append(subRuns, ref)
+		}
+	}
+	if len(subRuns) > 0 {
+		entry["subRuns"] = subRuns
+	}
+	return entry
+}
+
+func runHandlerEntries(addr runAddress, run daguapi.DAGRunDetails) map[string]any {
+	handlers := map[string]*daguapi.Node{
+		"onInit":    run.OnInit,
+		"onSuccess": run.OnSuccess,
+		"onFailure": run.OnFailure,
+		"onAbort":   run.OnAbort,
+		"onExit":    run.OnExit,
+		"onWait":    run.OnWait,
+	}
+	out := map[string]any{}
+	for key, node := range handlers {
+		if node != nil {
+			out[key] = runStepEntry(addr, *node)
+		}
+	}
+	return out
 }
 
 func classifyReadToolError(input readInput, err error) *readToolError {
@@ -1172,9 +1625,17 @@ func resourceURIForReadError(input readInput) string {
 	case readTargetWikiPage:
 		return wikiPageURI(input.Workspace, input.Path)
 	case readTargetRun:
+		if input.SubRunID != "" {
+			return subRunURI(input.Name, input.DAGRunID, input.SubRunID)
+		}
 		return runURI(input.Name, input.DAGRunID)
 	case readTargetRunLogs:
 		return runLogsURIWithQuery(input.Name, input.DAGRunID, input.Query)
+	case readTargetStepLog:
+		if input.SubRunID != "" {
+			return uriWithQuery(subStepLogURI(input.Name, input.DAGRunID, input.SubRunID, input.StepName), input.Query)
+		}
+		return uriWithQuery(stepLogURI(input.Name, input.DAGRunID, input.StepName), input.Query)
 	default:
 		return ""
 	}
@@ -1354,6 +1815,24 @@ func readResourceLinks(uri string) []resourceLink {
 					name:        "dag_run_step_log",
 					title:       "DAG-run step log",
 					description: "Log output for this DAG-run step.",
+					mimeType:    resourceMIMEJSON,
+				}}
+			}
+			if isSubStepLogResourceSegments(resource.segments) {
+				return []resourceLink{{
+					uri:         resource.rawURI,
+					name:        "sub_dag_run_step_log",
+					title:       "Sub DAG-run step log",
+					description: "Log output for this child DAG-run step.",
+					mimeType:    resourceMIMEJSON,
+				}}
+			}
+			if isSubRunResourceSegments(resource.segments) {
+				return []resourceLink{{
+					uri:         resource.rawURI,
+					name:        "sub_dag_run",
+					title:       "Sub DAG-run details",
+					description: "Child DAG-run details.",
 					mimeType:    resourceMIMEJSON,
 				}}
 			}

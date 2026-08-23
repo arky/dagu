@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	daguapi "github.com/dagucloud/dagu/v2/api/v1"
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
 	"github.com/dagucloud/dagu/v2/internal/persis"
 	persisfile "github.com/dagucloud/dagu/v2/internal/persis/file"
@@ -184,28 +185,102 @@ func TestDAGChangeInputValidation(t *testing.T) {
 func TestRetryRequiresStepNameForIncludeDownstream(t *testing.T) {
 	t.Parallel()
 
-	err := requireRetry(executeInput{
-		Name:              "example",
-		DAGRunID:          "run-1",
-		IncludeDownstream: true,
-	})
-	require.EqualError(t, err, "includeDownstream requires stepName")
+	_, executeErr := parseExecuteToolInput(json.RawMessage(
+		`{"action":"retry","name":"example","dagRunId":"run-1","includeDownstream":true}`,
+	))
+	require.NotNil(t, executeErr)
+	require.Equal(t, executeErrorInvalidToolInput, executeErr.Code)
+	require.Equal(t, executeFieldStepName, executeErr.Field)
 
-	err = requireRetry(executeInput{
-		Name:              "example",
-		DAGRunID:          "run-1",
-		StepName:          "build",
-		IncludeDownstream: true,
-	})
-	require.NoError(t, err)
+	input, executeErr := parseExecuteToolInput(json.RawMessage(
+		`{"action":"retry","name":"example","dagRunId":"run-1","stepName":"build","includeDownstream":true}`,
+	))
+	require.Nil(t, executeErr)
+	require.True(t, input.IncludeDownstream)
 
 	svc := &Service{}
-	err = svc.retryDAGRun(context.Background(), executeInput{
+	err := svc.retryDAGRun(context.Background(), executeInput{
 		Name:              "example",
 		DAGRunID:          "run-1",
 		IncludeDownstream: true,
 	})
 	require.EqualError(t, err, "includeDownstream requires stepName")
+}
+
+func TestExecuteInputValidation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		input     string
+		wantField string
+	}{
+		{name: "missing action", input: `{}`, wantField: executeFieldAction},
+		{name: "unknown action", input: `{"action":"restart"}`, wantField: executeFieldAction},
+		{name: "unknown field", input: `{"action":"start","name":"etl","force":true}`, wantField: "force"},
+		{name: "start requires name", input: `{"action":"start"}`, wantField: executeFieldName},
+		{name: "inline spec requires spec", input: `{"action":"start","targetType":"inline_spec","name":"inline"}`, wantField: executeFieldSpec},
+		{name: "inline spec requires name", input: `{"action":"start","spec":"steps: []"}`, wantField: executeFieldName},
+		{name: "stop requires dagRunId", input: `{"action":"stop","name":"etl"}`, wantField: executeFieldDAGRunID},
+		{name: "run target only for run actions", input: `{"action":"start","name":"etl","targetType":"run"}`, wantField: executeFieldTargetType},
+		{name: "stored DAG rejects spec", input: `{"action":"start","targetType":"dag","name":"etl","spec":"steps: []"}`, wantField: executeFieldSpec},
+		{name: "stored DAG rejects empty spec", input: `{"action":"start","targetType":"dag","name":"etl","spec":""}`, wantField: executeFieldSpec},
+		{name: "start rejects queue", input: `{"action":"start","name":"etl","queue":"batch"}`, wantField: executeFieldQueue},
+		{name: "enqueue rejects step name", input: `{"action":"enqueue","name":"etl","stepName":"build"}`, wantField: executeFieldStepName},
+		{name: "retry rejects params", input: `{"action":"retry","name":"etl","dagRunId":"run-1","params":"x=1"}`, wantField: executeFieldParams},
+		{name: "retry rejects disabled no reuse", input: `{"action":"retry","name":"etl","dagRunId":"run-1","noReuse":false}`, wantField: executeFieldNoReuse},
+		{name: "stop rejects step name", input: `{"action":"stop","name":"etl","dagRunId":"run-1","stepName":"build"}`, wantField: executeFieldStepName},
+		{name: "stop rejects disabled downstream", input: `{"action":"stop","name":"etl","dagRunId":"run-1","includeDownstream":false}`, wantField: executeFieldIncludeDownstream},
+		{name: "stop rejects empty labels", input: `{"action":"stop","name":"etl","dagRunId":"run-1","labels":[]}`, wantField: executeFieldLabels},
+		{name: "wait timeout requires wait", input: `{"action":"start","name":"etl","waitTimeoutSeconds":30}`, wantField: executeFieldWaitTimeoutSeconds},
+		{name: "wait timeout rejects zero", input: `{"action":"start","name":"etl","wait":true,"waitTimeoutSeconds":0}`, wantField: executeFieldWaitTimeoutSeconds},
+		{name: "wait timeout range", input: `{"action":"start","name":"etl","wait":true,"waitTimeoutSeconds":301}`, wantField: executeFieldWaitTimeoutSeconds},
+		{name: "params must be string or object", input: `{"action":"start","name":"etl","params":[1]}`, wantField: executeFieldParams},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, executeErr := parseExecuteToolInput(json.RawMessage(test.input))
+			require.NotNil(t, executeErr)
+			require.Equal(t, executeErrorInvalidToolInput, executeErr.Code)
+			require.Equal(t, test.wantField, executeErr.Field)
+		})
+	}
+}
+
+func TestExecuteInputDefaultsAndParams(t *testing.T) {
+	t.Parallel()
+
+	input, executeErr := parseExecuteToolInput(json.RawMessage(
+		`{"action":"start","name":"etl","params":{"TARGET":"orders","LIMIT":10}}`,
+	))
+	require.Nil(t, executeErr)
+	require.Equal(t, executeTargetTypeDAG, input.TargetType)
+	require.JSONEq(t, `{"TARGET":"orders","LIMIT":10}`, input.Params)
+
+	input, executeErr = parseExecuteToolInput(json.RawMessage(
+		`{"action":"start","name":"etl","params":"  KEY=value  "}`,
+	))
+	require.Nil(t, executeErr)
+	require.Equal(t, "KEY=value", input.Params)
+
+	input, executeErr = parseExecuteToolInput(json.RawMessage(
+		`{"action":"retry","name":"etl","dagRunId":"run-1","params":"  "}`,
+	))
+	require.Nil(t, executeErr)
+	require.Empty(t, input.Params)
+
+	input, executeErr = parseExecuteToolInput(json.RawMessage(
+		`{"action":"enqueue","name":"inline","spec":"steps: []"}`,
+	))
+	require.Nil(t, executeErr)
+	require.Equal(t, executeTargetTypeInlineSpec, input.TargetType)
+
+	input, executeErr = parseExecuteToolInput(json.RawMessage(
+		`{"action":"stop","name":"etl","dagRunId":"run-1"}`,
+	))
+	require.Nil(t, executeErr)
+	require.Equal(t, executeTargetTypeRun, input.TargetType)
 }
 
 func TestExecuteToolSupportsNoReuse(t *testing.T) {
@@ -225,6 +300,19 @@ func TestExecuteToolSupportsNoReuse(t *testing.T) {
 	enqueueBody := enqueueBody(executeInput{NoReuse: true})
 	require.NotNil(t, enqueueBody.NoReuse)
 	require.True(t, *enqueueBody.NoReuse)
+}
+
+func TestExecuteBodiesUseRequestedDAGName(t *testing.T) {
+	t.Parallel()
+
+	input := executeInput{Name: "renamed-dag"}
+	startBody := executeBody(input)
+	require.NotNil(t, startBody.DagName)
+	require.Equal(t, input.Name, *startBody.DagName)
+
+	enqueueBody := enqueueBody(input)
+	require.NotNil(t, enqueueBody.DagName)
+	require.Equal(t, input.Name, *enqueueBody.DagName)
 }
 
 func TestServerAdvertisesSupportedCapabilities(t *testing.T) {
@@ -298,9 +386,50 @@ func TestServerExposesStepLogResource(t *testing.T) {
 	}`))
 	require.Nil(t, readErr)
 	require.Equal(t, expectedURI, input.URI)
+}
 
-	_, err = session.ReadResource(ctx, &mcpsdk.ReadResourceParams{URI: expectedURI + "?tail=100"})
-	require.Error(t, err)
+func TestStepLogQueryValidation(t *testing.T) {
+	t.Parallel()
+
+	valid := []string{"tail=10000", "head=10000", "offset=10001&limit=10000", "limit=10", "stream=stderr", "tail=5&stream=stdout"}
+	for _, query := range valid {
+		input, readErr := parseReadResourceURI("dagu://runs/demo/run-1/steps/main/logs?" + query)
+		require.Nil(t, readErr, query)
+		require.Equal(t, readTargetStepLog, input.Target)
+		require.Equal(t, query, input.Query)
+	}
+
+	invalid := []string{
+		"tail=0",
+		"tail=x",
+		"head=10001",
+		"tail=10001",
+		"limit=10001",
+		"tail=10&head=10",
+		"tail=10&limit=10",
+		"head=10&offset=10",
+		"stream=both",
+		"unknown=1",
+	}
+	for _, query := range invalid {
+		_, readErr := parseReadResourceURI("dagu://runs/demo/run-1/steps/main/logs?" + query)
+		require.NotNil(t, readErr, query)
+		require.Equal(t, readErrorInvalidResourceURI, readErr.Code, query)
+	}
+
+	input, readErr := parseReadToolInput(json.RawMessage(`{
+		"target":"step_log",
+		"name":"demo",
+		"dagRunId":"run-1",
+		"stepName":"main",
+		"query":"tail=25&stream=stderr"
+	}`))
+	require.Nil(t, readErr)
+	require.Equal(t, "dagu://runs/demo/run-1/steps/main/logs?tail=25&stream=stderr", input.URI)
+
+	opts := stepLogReadOptions(input.Query)
+	require.Equal(t, 25, opts.Tail)
+	require.Equal(t, "stderr", opts.Stream)
 }
 
 func TestReadToolValidatesDAGQuery(t *testing.T) {
@@ -396,8 +525,6 @@ func TestServerExposesReferenceResourcesAndPrompts(t *testing.T) {
 	require.Contains(t, names, "dagu_edit_dag")
 	require.Contains(t, names, "dagu_create_wiki_page")
 	require.Contains(t, names, "dagu_edit_wiki_page")
-	require.Contains(t, names, "dagu_create_doc")
-	require.Contains(t, names, "dagu_edit_doc")
 	require.Contains(t, names, "dagu_debug_failed_run")
 }
 
@@ -505,26 +632,6 @@ func TestWikiPagePromptsIncludeRequiredUpsertFields(t *testing.T) {
 			request:        "Add the rollback steps.",
 			wantFieldBlock: "mode=preview, type=upsert_wiki_page, workspace=operations, path=runbooks/restart, and content set to the complete edited Markdown",
 		},
-		{
-			name: "dagu_create_doc",
-			arguments: map[string]string{
-				"workspace": "operations",
-				"path":      "runbooks/restart",
-				"goal":      "Describe a safe restart.",
-			},
-			request:        "Describe a safe restart.",
-			wantFieldBlock: "mode=preview, type=upsert_wiki_page, workspace=operations, path=runbooks/restart, and content set to the complete drafted Markdown",
-		},
-		{
-			name: "dagu_edit_doc",
-			arguments: map[string]string{
-				"workspace": "operations",
-				"path":      "runbooks/restart",
-				"change":    "Add the rollback steps.",
-			},
-			request:        "Add the rollback steps.",
-			wantFieldBlock: "mode=preview, type=upsert_wiki_page, workspace=operations, path=runbooks/restart, and content set to the complete edited Markdown",
-		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -550,6 +657,281 @@ func TestWikiPagePromptsIncludeRequiredUpsertFields(t *testing.T) {
 			require.Equal(t, test.wantFieldBlock, fieldBlock)
 		})
 	}
+}
+
+func TestRankNameSuggestions(t *testing.T) {
+	t.Parallel()
+
+	candidates := []string{"nightly-report", "nightly-cleanup", "billing-export", "etl"}
+
+	require.Equal(t, []string{"nightly-report"}, rankNameSuggestions("nightly-reprot", candidates))
+	// Substring matches rank ahead of larger edit distances.
+	require.Equal(t, []string{"nightly-cleanup", "nightly-report"}, rankNameSuggestions("nightly", candidates))
+	// The exact name is not suggested back and unrelated names are dropped.
+	require.Empty(t, rankNameSuggestions("etl", []string{"etl"}))
+	require.Empty(t, rankNameSuggestions("zzzz", candidates))
+}
+
+func TestReadToolNotFoundSuggestsCloseDAGNames(t *testing.T) {
+	ctx := context.Background()
+	store := testutil.NewFileDAGRepository(t.TempDir(), filedag.WithSkipExamples(true))
+	require.NoError(t, store.Create(ctx, "nightly-report", []byte("name: nightly-report\nsteps: []\n")))
+	api := frontendapi.New(store, nil, nil, nil, runtime.Manager{}, &config.Config{}, nil, nil, prometheus.NewRegistry(), nil)
+	session := connectTestClient(t, ctx, NewServer(api))
+
+	result := callTool(t, ctx, session, toolRead, readInput{Target: readTargetDAGSpec, Name: "nightly-reprot"})
+	require.True(t, result.IsError)
+	output := structuredMap(t, result)
+	require.Equal(t, readErrorResourceNotFound, output["code"])
+	details, ok := output["details"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, []any{"nightly-report"}, details["didYouMean"])
+}
+
+func TestDAGSearchInputValidation(t *testing.T) {
+	t.Parallel()
+
+	input, readErr := parseReadToolInput(json.RawMessage(`{"target":"dag_search","search":"postgres","limit":10}`))
+	require.Nil(t, readErr)
+	require.Equal(t, readTargetDAGSearch, input.Target)
+	require.Equal(t, "postgres", input.Search)
+	require.Equal(t, "all", input.Workspace)
+	require.Equal(t, 10, input.Limit)
+
+	_, readErr = parseReadToolInput(json.RawMessage(`{"target":"dag_search"}`))
+	require.NotNil(t, readErr)
+	require.Equal(t, readErrorInvalidToolInput, readErr.Code)
+	require.Equal(t, readFieldSearch, readErr.Field)
+
+	_, readErr = parseReadToolInput(json.RawMessage(`{"target":"dag_search","search":"x","prefix":"guides"}`))
+	require.NotNil(t, readErr)
+	require.Equal(t, readFieldPrefix, readErr.Field)
+
+	_, readErr = parseReadToolInput(json.RawMessage(`{"target":"dag_search","search":"x","query":"page=1"}`))
+	require.NotNil(t, readErr)
+	require.Equal(t, readFieldQuery, readErr.Field)
+}
+
+func TestNormalizeRunDetailsIncludesStepsAndFailureDetails(t *testing.T) {
+	t.Parallel()
+
+	stepError := "exit status 1"
+	queuedAt := "2026-08-23T01:00:00Z"
+	params := `{"TARGET":"orders"}`
+	raw := daguapi.GetDAGRunDetails200JSONResponse{
+		DagRunDetails: daguapi.DAGRunDetails{
+			Name:        "etl",
+			DagRunId:    "run-1",
+			Status:      2,
+			StatusLabel: "failed",
+			StartedAt:   "2026-08-23T01:00:05Z",
+			FinishedAt:  "2026-08-23T01:00:09Z",
+			QueuedAt:    &queuedAt,
+			Params:      &params,
+			Nodes: []daguapi.Node{
+				{
+					Step:        daguapi.Step{Name: "extract"},
+					Status:      4,
+					StatusLabel: "finished",
+					StartedAt:   "2026-08-23T01:00:05Z",
+					FinishedAt:  "2026-08-23T01:00:06Z",
+				},
+				{
+					Step:        daguapi.Step{Name: "load"},
+					Status:      2,
+					StatusLabel: "failed",
+					Error:       &stepError,
+				},
+			},
+			OnFailure: &daguapi.Node{
+				Step:        daguapi.Step{Name: "onFailure"},
+				Status:      4,
+				StatusLabel: "finished",
+			},
+		},
+	}
+
+	data, err := normalizeRunDetails(raw, runAddress{})
+	require.NoError(t, err)
+	require.Equal(t, "etl", data["name"])
+	require.Equal(t, "run-1", data["dagRunId"])
+	require.Equal(t, "dagu://runs/etl/run-1", data["uri"])
+	require.Equal(t, "dagu://runs/etl/run-1/logs", data["logsUri"])
+	require.Equal(t, "2026-08-23T01:00:05Z", data["startedAt"])
+	require.Equal(t, "2026-08-23T01:00:09Z", data["finishedAt"])
+	require.Equal(t, queuedAt, data["queuedAt"])
+	require.Equal(t, params, data["params"])
+	require.NotContains(t, data, "rootRun")
+	require.NotContains(t, data, "parentRun")
+
+	steps, ok := data["steps"].([]map[string]any)
+	require.True(t, ok)
+	require.Len(t, steps, 2)
+	require.Equal(t, "extract", steps[0]["name"])
+	require.NotContains(t, steps[0], "error")
+	require.Equal(t, "load", steps[1]["name"])
+	require.Equal(t, stepError, steps[1]["error"])
+	require.Equal(t, "dagu://runs/etl/run-1/steps/load/logs", steps[1]["logUri"])
+	require.NotContains(t, steps[1], "startedAt")
+
+	handlers, ok := data["handlers"].(map[string]any)
+	require.True(t, ok)
+	require.Len(t, handlers, 1)
+	handler, ok := handlers["onFailure"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "onFailure", handler["name"])
+}
+
+func TestNormalizeRunDetailsIncludesRunHierarchy(t *testing.T) {
+	t.Parallel()
+
+	parentID := "parent-run"
+	parentName := "root-dag"
+	subDAGName := "child-dag"
+	repeatedSubDAGName := "repeated-child-dag"
+	raw := daguapi.GetDAGRunDetails200JSONResponse{
+		DagRunDetails: daguapi.DAGRunDetails{
+			Name:             "middle-dag",
+			DagRunId:         "run-2",
+			Status:           4,
+			StatusLabel:      "finished",
+			RootDAGRunId:     "root-run",
+			RootDAGRunName:   "root-dag",
+			ParentDAGRunId:   &parentID,
+			ParentDAGRunName: &parentName,
+			Nodes: []daguapi.Node{
+				{
+					Step:        daguapi.Step{Name: "call-child"},
+					Status:      4,
+					StatusLabel: "finished",
+					SubRuns: &[]daguapi.SubDAGRun{
+						{DagName: &subDAGName, DagRunId: "child-run"},
+					},
+					SubRunsRepeated: &[]daguapi.SubDAGRun{
+						{DagName: &repeatedSubDAGName, DagRunId: "repeated-child-run"},
+					},
+				},
+			},
+		},
+	}
+
+	data, err := normalizeRunDetails(raw, runAddress{})
+	require.NoError(t, err)
+	require.Equal(t, map[string]any{
+		"name":     "root-dag",
+		"dagRunId": "root-run",
+		"uri":      "dagu://runs/root-dag/root-run",
+	}, data["rootRun"])
+	require.Equal(t, map[string]any{"name": "root-dag", "dagRunId": "parent-run"}, data["parentRun"])
+
+	steps, ok := data["steps"].([]map[string]any)
+	require.True(t, ok)
+	subRuns, ok := steps[0]["subRuns"].([]map[string]any)
+	require.True(t, ok)
+	require.Equal(t, []map[string]any{
+		{
+			"dagName":  "child-dag",
+			"dagRunId": "child-run",
+			"uri":      "dagu://runs/middle-dag/run-2/sub/child-run",
+		},
+		{
+			"dagName":  "repeated-child-dag",
+			"dagRunId": "repeated-child-run",
+			"uri":      "dagu://runs/middle-dag/run-2/sub/repeated-child-run",
+		},
+	}, subRuns)
+}
+
+func TestNormalizeRunListIncludesTimestampsAndCursor(t *testing.T) {
+	t.Parallel()
+
+	cursor := "opaque-cursor"
+	raw := daguapi.DAGRunsPageResponse{
+		DagRuns: []daguapi.DAGRunSummary{
+			{
+				Name:        "etl",
+				DagRunId:    "run-1",
+				Status:      4,
+				StatusLabel: "finished",
+				StartedAt:   "2026-08-23T01:00:05Z",
+				FinishedAt:  "2026-08-23T01:00:09Z",
+			},
+			{
+				Name:        "etl",
+				DagRunId:    "run-0",
+				Status:      0,
+				StatusLabel: "not started",
+				StartedAt:   "-",
+				FinishedAt:  "-",
+			},
+		},
+		NextCursor: &cursor,
+	}
+
+	data, err := normalizeRunList(raw)
+	require.NoError(t, err)
+	require.Equal(t, cursor, data["nextCursor"])
+
+	items, ok := data["items"].([]map[string]any)
+	require.True(t, ok)
+	require.Len(t, items, 2)
+	require.Equal(t, "2026-08-23T01:00:05Z", items[0]["startedAt"])
+	require.Equal(t, "2026-08-23T01:00:09Z", items[0]["finishedAt"])
+	require.NotContains(t, items[1], "startedAt")
+	require.NotContains(t, items[1], "finishedAt")
+}
+
+func TestNormalizeDAGListIncludesSummaryFields(t *testing.T) {
+	t.Parallel()
+
+	description := "Nightly ETL"
+	nextRun := time.Date(2026, 8, 24, 2, 0, 0, 0, time.UTC)
+	raw := daguapi.ListDAGs200JSONResponse{
+		Dags: []daguapi.DAGFile{
+			{
+				FileName: "etl",
+				Dag: daguapi.DAG{
+					Name:        "etl",
+					Description: &description,
+					Schedule:    &[]daguapi.Schedule{{Expression: "0 2 * * *"}},
+				},
+				Suspended: true,
+				NextRun:   &nextRun,
+				LatestDAGRun: daguapi.DAGRunSummary{
+					Name:        "etl",
+					DagRunId:    "run-1",
+					Status:      2,
+					StatusLabel: "failed",
+					StartedAt:   "2026-08-23T02:00:00Z",
+					FinishedAt:  "2026-08-23T02:00:05Z",
+				},
+			},
+			{FileName: "never-ran", Dag: daguapi.DAG{Name: "never-ran"}},
+		},
+		Pagination: daguapi.Pagination{CurrentPage: 1, TotalPages: 1, TotalRecords: 2},
+	}
+
+	data, err := normalizeDAGList(raw)
+	require.NoError(t, err)
+	require.Equal(t, daguapi.Pagination{CurrentPage: 1, TotalPages: 1, TotalRecords: 2}, data["pagination"])
+
+	items, ok := data["items"].([]map[string]any)
+	require.True(t, ok)
+	require.Len(t, items, 2)
+
+	require.Equal(t, "etl", items[0]["name"])
+	require.Equal(t, description, items[0]["description"])
+	require.Equal(t, []string{"0 2 * * *"}, items[0]["schedule"])
+	require.Equal(t, true, items[0]["suspended"])
+	require.Equal(t, "2026-08-24T02:00:00Z", items[0]["nextRun"])
+	latest, ok := items[0]["latestRun"].(map[string]any)
+	require.True(t, ok)
+	require.Equal(t, "run-1", latest["dagRunId"])
+	require.Equal(t, "dagu://runs/etl/run-1", latest["uri"])
+
+	require.Equal(t, "never-ran", items[1]["name"])
+	require.NotContains(t, items[1], "latestRun")
+	require.NotContains(t, items[1], "description")
 }
 
 func TestRunLogsURIWithQueryPreservesQuery(t *testing.T) {
