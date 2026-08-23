@@ -5,6 +5,7 @@ package coordinator_test
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -71,6 +72,9 @@ func TestClientDispatch(t *testing.T) {
 		require.NoError(t, os.WriteFile(filepath.Join(root, "input.txt"), []byte("input"), 0o644))
 		dagFile := filepath.Join(root, "dag.yaml")
 		definition := "name: test\nsteps:\n  - name: consume\n    run: cat input.txt\n    dependencies: input.txt\n"
+		workspaceBundleDir := filepath.Join(t.TempDir(), "workspace-bundles")
+		stagingDir := filepath.Join(workspaceBundleDir, "staging")
+		dest := filepath.Join(t.TempDir(), "workspace")
 
 		var uploaded []byte
 		mockCoord := &mockCoordinatorService{
@@ -78,32 +82,48 @@ func TestClientDispatch(t *testing.T) {
 				return &coordinatorv1.HasWorkspaceBundleResponse{}, nil
 			},
 			putWorkspaceBundleFunc: func(stream coordinatorv1.CoordinatorService_PutWorkspaceBundleServer) error {
+				entries, err := os.ReadDir(stagingDir)
+				if err != nil {
+					return fmt.Errorf("read workspace bundle staging directory: %w", err)
+				}
+				if len(entries) != 1 {
+					return fmt.Errorf("workspace bundle staging directory contains %d entries, want 1", len(entries))
+				}
 				for {
 					chunk, err := stream.Recv()
 					if err == io.EOF {
 						return stream.SendAndClose(&coordinatorv1.PutWorkspaceBundleResponse{Accepted: true})
 					}
-					require.NoError(t, err)
+					if err != nil {
+						return fmt.Errorf("receive workspace bundle chunk: %w", err)
+					}
 					uploaded = append(uploaded, chunk.Data...)
 				}
 			},
 			dispatchFunc: func(_ context.Context, req *coordinatorv1.DispatchRequest) (*coordinatorv1.DispatchResponse, error) {
-				assert.NotEmpty(t, req.Task.WorkspaceBundleDigest)
-				assert.Equal(t, int64(len(uploaded)), req.Task.WorkspaceBundleSize)
-				assert.Equal(t, "dag.yaml", req.Task.WorkspaceBundleDagPath)
 				if req.Task.WorkspaceBundleDigest == "" {
-					return &coordinatorv1.DispatchResponse{}, nil
+					return nil, fmt.Errorf("workspace bundle digest is empty")
 				}
-				dest := filepath.Join(t.TempDir(), "workspace")
-				require.NoError(t, workspacebundle.Extract(uploaded, dest, workspacebundle.Descriptor{
+				if req.Task.WorkspaceBundleSize != int64(len(uploaded)) {
+					return nil, fmt.Errorf("workspace bundle size is %d, want %d", req.Task.WorkspaceBundleSize, len(uploaded))
+				}
+				if req.Task.WorkspaceBundleDagPath != "dag.yaml" {
+					return nil, fmt.Errorf("workspace bundle DAG path is %q, want dag.yaml", req.Task.WorkspaceBundleDagPath)
+				}
+				if err := workspacebundle.Extract(uploaded, dest, workspacebundle.Descriptor{
 					Digest:  req.Task.WorkspaceBundleDigest,
 					Size:    req.Task.WorkspaceBundleSize,
 					DAGPath: req.Task.WorkspaceBundleDagPath,
-				}, workspacebundle.DefaultLimits()))
-				assert.FileExists(t, filepath.Join(dest, "input.txt"))
+				}, workspacebundle.DefaultLimits()); err != nil {
+					return nil, fmt.Errorf("extract uploaded workspace bundle: %w", err)
+				}
 				actualDAG, err := os.ReadFile(filepath.Join(dest, "dag.yaml"))
-				require.NoError(t, err)
-				assert.Equal(t, definition, string(actualDAG))
+				if err != nil {
+					return nil, fmt.Errorf("read uploaded DAG: %w", err)
+				}
+				if string(actualDAG) != definition {
+					return nil, fmt.Errorf("uploaded DAG does not match its definition")
+				}
 				return &coordinatorv1.DispatchResponse{}, nil
 			},
 		}
@@ -113,6 +133,7 @@ func TestClientDispatch(t *testing.T) {
 		host, port := parseHostPort(addr)
 		config := coordinator.DefaultConfig()
 		config.MaxRetries = 0
+		config.WorkspaceBundleDir = workspaceBundleDir
 		client := coordinator.New(&mockServiceMonitor{members: []serviceregistry.HostInfo{{
 			ID: "coord-1", Host: host, Port: port, Status: serviceregistry.ServiceStatusActive,
 		}}}, config)
@@ -124,6 +145,10 @@ func TestClientDispatch(t *testing.T) {
 			SourceFile: dagFile,
 		}})
 		require.NoError(t, err)
+		assert.FileExists(t, filepath.Join(dest, "input.txt"))
+		entries, err := os.ReadDir(stagingDir)
+		require.NoError(t, err)
+		assert.Empty(t, entries)
 	})
 
 	t.Run("Success", func(t *testing.T) {
@@ -270,6 +295,24 @@ func TestClientDispatch(t *testing.T) {
 		require.ErrorAs(t, err, &staleErr)
 		require.Equal(t, "queued attempt was superseded", staleErr.Reason)
 	})
+}
+
+func TestClientDispatchRejectsFileDependenciesWithoutWorkspaceBundleDir(t *testing.T) {
+	root := t.TempDir()
+	t.Chdir(root)
+	require.NoError(t, os.WriteFile(filepath.Join(root, "input.txt"), []byte("input"), 0o644))
+	dagFile := filepath.Join(root, "dag.yaml")
+	definition := "name: test\nsteps:\n  - name: consume\n    run: cat input.txt\n    dependencies: input.txt\n"
+
+	client := coordinator.New(&mockServiceMonitor{}, coordinator.DefaultConfig())
+	err := client.Dispatch(context.Background(), dispatch.DispatchRequest{Task: &dispatch.DispatchTask{
+		DAGRunID:   "run-1",
+		Target:     "test",
+		Definition: definition,
+		SourceFile: dagFile,
+	}})
+	require.ErrorContains(t, err, "workspace bundle directory is not configured")
+	assert.NoDirExists(t, filepath.Join(root, "staging"))
 }
 
 func TestClientPoll(t *testing.T) {

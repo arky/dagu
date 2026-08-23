@@ -33,12 +33,15 @@ type queueDispatchDeps struct {
 	dagRunLeaseStore       dispatch.DAGRunLeaseStore
 	dispatchTaskStore      dispatch.DispatchTaskStore
 	dispatchAdmissionStore dispatch.DispatchAdmissionStore
+	workerHeartbeatStore   dispatch.WorkerHeartbeatStore
+	workerStaleAfter       time.Duration
 	dagExecutor            *DAGExecutor
 	isSuspended            IsSuspendedFunc
 	backoffConfig          BackoffConfig
 	leaseStaleThreshold    time.Duration
 	isClosed               func() bool
 	wakeUp                 func()
+	acquireDispatchHandoff func(context.Context) (func(), bool)
 }
 
 // queueDispatcher owns queue-item dispatch decisions after a queue has capacity.
@@ -49,12 +52,15 @@ type queueDispatcher struct {
 	dagRunLeaseStore       dispatch.DAGRunLeaseStore
 	dispatchTaskStore      dispatch.DispatchTaskStore
 	dispatchAdmissionStore dispatch.DispatchAdmissionStore
+	workerHeartbeatStore   dispatch.WorkerHeartbeatStore
+	workerStaleAfter       time.Duration
 	dagExecutor            *DAGExecutor
 	isSuspended            IsSuspendedFunc
 	backoffConfig          BackoffConfig
 	leaseStaleThreshold    time.Duration
 	isClosed               func() bool
 	wakeUp                 func()
+	acquireDispatchHandoff func(context.Context) (func(), bool)
 
 	queuedConditionCursorMu sync.Mutex
 	queuedConditionCursor   map[string]int
@@ -65,6 +71,26 @@ type queueDispatchBatch struct {
 	maxConcurrency        int
 	aliveCount            int
 	nonAdmissionOccupancy int
+}
+
+type workerHeartbeatSnapshot struct {
+	records []dispatch.WorkerHeartbeatRecord
+	err     error
+	loaded  bool
+}
+
+func (s *workerHeartbeatSnapshot) load(
+	ctx context.Context,
+	store dispatch.WorkerHeartbeatStore,
+) ([]dispatch.WorkerHeartbeatRecord, error) {
+	if !s.loaded {
+		s.loaded = true
+		s.records, s.err = store.List(ctx)
+		if s.err != nil {
+			logger.Error(ctx, "Failed to list worker heartbeats", tag.Error(s.err))
+		}
+	}
+	return s.records, s.err
 }
 
 type dispatchAdmissionInput struct {
@@ -294,6 +320,11 @@ func newQueueDispatcher(deps queueDispatchDeps) *queueDispatcher {
 	if deps.wakeUp == nil {
 		deps.wakeUp = func() {}
 	}
+	if deps.acquireDispatchHandoff == nil {
+		deps.acquireDispatchHandoff = func(context.Context) (func(), bool) {
+			return func() {}, true
+		}
+	}
 	return &queueDispatcher{
 		queueStore:             deps.queueStore,
 		dagRunRepository:       deps.dagRunRepository,
@@ -301,12 +332,15 @@ func newQueueDispatcher(deps queueDispatchDeps) *queueDispatcher {
 		dagRunLeaseStore:       deps.dagRunLeaseStore,
 		dispatchTaskStore:      deps.dispatchTaskStore,
 		dispatchAdmissionStore: deps.dispatchAdmissionStore,
+		workerHeartbeatStore:   deps.workerHeartbeatStore,
+		workerStaleAfter:       deps.workerStaleAfter,
 		dagExecutor:            deps.dagExecutor,
 		isSuspended:            deps.isSuspended,
 		backoffConfig:          deps.backoffConfig,
 		leaseStaleThreshold:    deps.leaseStaleThreshold,
 		isClosed:               deps.isClosed,
 		wakeUp:                 deps.wakeUp,
+		acquireDispatchHandoff: deps.acquireDispatchHandoff,
 		queuedConditionCursor:  make(map[string]int),
 	}
 }
@@ -465,11 +499,19 @@ func (s *queuedConditionStage) observe(defs ...queuedConditionDef) {
 }
 
 func (s *queuedConditionStage) flush(ctx context.Context) {
+	s.flushWithQueueCheck(ctx, true)
+}
+
+func (s *queuedConditionStage) flushWithoutQueueCheck(ctx context.Context) {
+	s.flushWithQueueCheck(ctx, false)
+}
+
+func (s *queuedConditionStage) flushWithQueueCheck(ctx context.Context, checkQueue bool) {
 	if s == nil || s.flushed || len(s.observations) == 0 {
 		return
 	}
 	s.flushed = true
-	if err := s.flushErr(ctx); err != nil {
+	if err := s.flushErr(ctx, checkQueue); err != nil {
 		logger.Warn(ctx, "Failed to update queued DAG-run condition",
 			tag.Error(err),
 			tag.RunID(s.runRef.ID),
@@ -477,8 +519,8 @@ func (s *queuedConditionStage) flush(ctx context.Context) {
 	}
 }
 
-func (s *queuedConditionStage) flushErr(ctx context.Context) error {
-	if !s.itemStillQueued(ctx) {
+func (s *queuedConditionStage) flushErr(ctx context.Context, checkQueue bool) error {
+	if checkQueue && !s.itemStillQueued(ctx) {
 		return nil
 	}
 
@@ -827,49 +869,11 @@ func (d *queueDispatcher) dispatchAndWaitForStartupWithConditions(
 	admissionReservationToken string,
 	conditionStage *queuedConditionStage,
 ) bool {
-	policy := backoff.NewExponentialBackoffPolicy(d.backoffConfig.InitialInterval)
-	policy.MaxInterval = d.backoffConfig.MaxInterval
-	policy.MaxRetries = d.backoffConfig.MaxRetries
-	retryCtx := backoff.WithRetryFailureLogLevel(ctx, slog.LevelInfo)
-
 	launchedAt := time.Now()
-	var started bool
-	dispatched := false
+	defer d.wakeUp()
 
-	operation := func(ctx context.Context) error {
-		if err := d.checkContextAndQuit(ctx); err != nil {
-			return err
-		}
-
-		if !dispatched {
-			err := d.dagExecutor.ExecuteDAGWithAdmission(ctx, dag, dispatch.DispatchOperationRetry,
-				runID, dagStatus, dagStatus.TriggerType, dagStatus.ScheduleTime, admissionReservationToken)
-			if err != nil {
-				if _, ok := errors.AsType[*queuedomain.StaleQueueDispatchError](err); ok {
-					return backoff.PermanentError(err)
-				}
-				if errors.Is(err, backoff.ErrPermanent) {
-					logger.Error(ctx, "Permanent dispatch failure", tag.Error(err))
-					return err
-				}
-				logger.Warn(ctx, "Transient dispatch failure, will retry", tag.Error(err))
-				return err
-			}
-			dispatched = true
-			if admissionReservationToken != "" {
-				started = true
-				return nil
-			}
-		}
-
-		var err error
-		started, err = d.checkStartupStatus(ctx, queueName, runRef, startupWaitState{
-			launchedAt: launchedAt,
-		})
-		return err
-	}
-
-	if err := backoff.Retry(retryCtx, operation, policy, nil); err != nil {
+	err := d.executeDistributedHandoff(ctx, dag, runID, dagStatus, admissionReservationToken)
+	if err != nil {
 		d.releaseAdmissionToken(ctx, admissionReservationToken)
 		if staleErr, ok := errors.AsType[*queuedomain.StaleQueueDispatchError](err); ok {
 			logger.Info(ctx, "Discarding stale distributed queue dispatch",
@@ -880,21 +884,36 @@ func (d *queueDispatcher) dispatchAndWaitForStartupWithConditions(
 			)
 			return true
 		}
-		logger.Error(ctx, "Failed to dispatch DAG after retries", tag.Error(err))
+		logger.Warn(ctx, "Failed to dispatch DAG; leaving it queued for the next scan", tag.Error(err))
 		if shouldRecordStartupCondition(err) {
-			if errors.Is(err, errRunLivenessUnavailable) {
-				conditionStage.observe(runLivenessUnavailableConditionDefs...)
-			} else if dispatched && startupNotObserved(err) {
-				conditionStage.observe(startupNotObservedConditionDefs...)
-			} else {
-				conditionStage.observe(queuedDispatchCondition(err)...)
-			}
+			conditionStage.observe(queuedDispatchCondition(err)...)
 			conditionStage.flush(ctx)
 		}
+		return false
 	}
 
-	defer d.wakeUp()
-	return started
+	if admissionReservationToken != "" {
+		return true
+	}
+	return d.waitForStartupWithConditions(ctx, queueName, runRef, startupWaitState{
+		launchedAt: launchedAt,
+	}, conditionStage)
+}
+
+func (d *queueDispatcher) executeDistributedHandoff(
+	ctx context.Context,
+	dag *ir.DAG,
+	runID string,
+	dagStatus *ir.DAGRunStatus,
+	admissionReservationToken string,
+) error {
+	release, acquired := d.acquireDispatchHandoff(ctx)
+	if !acquired {
+		return d.checkContextAndQuit(ctx)
+	}
+	defer release()
+	return d.dagExecutor.ExecuteDAGWithAdmission(ctx, dag, dispatch.DispatchOperationRetry,
+		runID, dagStatus, dagStatus.TriggerType, dagStatus.ScheduleTime, admissionReservationToken)
 }
 
 func (d *queueDispatcher) reserveDistributedAdmission(
@@ -1121,10 +1140,6 @@ func localLaunchFailed(err error) bool {
 	return !errors.As(err, &exitErr)
 }
 
-func startupNotObserved(err error) bool {
-	return errors.Is(err, errNotStarted) || errors.Is(err, errExecutionExitedBeforeStartup)
-}
-
 func shouldBoundLocalStartupError(waitState startupWaitState, err error) bool {
 	return waitState.execDone != nil &&
 		err != nil &&
@@ -1246,6 +1261,11 @@ func (d *queueDispatcher) selectRunnableQueueItemsInQueue(
 	}
 
 	runnable := make([]queuedomain.QueuedItemData, 0, min(freeSlots, len(items)))
+	workerSnapshot := workerHeartbeatSnapshot{}
+	var workerConditionStages []*queuedConditionStage
+	defer func() {
+		d.flushQueuedConditionStages(ctx, queueName, workerConditionStages)
+	}()
 	for _, item := range items {
 		if len(runnable) >= freeSlots {
 			break
@@ -1270,10 +1290,130 @@ func (d *queueDispatcher) selectRunnableQueueItemsInQueue(
 				continue
 			}
 		}
+		if d.workerHeartbeatStore != nil {
+			recordCondition := len(workerConditionStages) < queuedConditionRefreshBatchLimit
+			eligible, conditionStage := d.queueItemHasEligibleWorker(
+				ctx, queueName, item, *runRef, &workerSnapshot, recordCondition,
+			)
+			if !eligible {
+				if conditionStage != nil {
+					workerConditionStages = append(workerConditionStages, conditionStage)
+				}
+				continue
+			}
+		}
 		runnable = append(runnable, item)
 	}
 
 	return runnable, nil
+}
+
+func (d *queueDispatcher) queueItemHasEligibleWorker(
+	ctx context.Context,
+	queueName string,
+	item queuedomain.QueuedItemData,
+	runRef ir.DAGRunRef,
+	workerSnapshot *workerHeartbeatSnapshot,
+	recordCondition bool,
+) (bool, *queuedConditionStage) {
+	attempt, err := d.dagRunRepository.FindAttempt(ctx, runRef)
+	if err != nil || attempt.Hidden() {
+		return true, nil
+	}
+	status, err := attempt.ReadStatus(ctx)
+	if err != nil || status.Status != ir.Queued {
+		return true, nil
+	}
+	dag, err := attempt.ReadDAG(ctx)
+	if err != nil || !d.dagExecutor.IsDistributed(dag) {
+		return true, nil
+	}
+
+	records, err := workerSnapshot.load(ctx, d.workerHeartbeatStore)
+	var conditionDefs []queuedConditionDef
+	if err != nil {
+		conditionDefs = assignmentUnavailableConditionDefs
+	} else {
+		available, defs := workerAvailableInSnapshot(records, time.Now().UTC(), d.workerStaleAfter, dag, status)
+		if available {
+			return true, nil
+		}
+		conditionDefs = defs
+	}
+	if !recordCondition {
+		return false, nil
+	}
+
+	conditionStage := d.newQueuedConditionStage(runRef, queueName, item.ID(), attempt, status)
+	conditionStage.observe(conditionDefs...)
+	return false, conditionStage
+}
+
+func (d *queueDispatcher) flushQueuedConditionStages(
+	ctx context.Context,
+	queueName string,
+	stages []*queuedConditionStage,
+) {
+	if len(stages) == 0 {
+		return
+	}
+	if d.queueStore == nil || queueName == "" {
+		for _, stage := range stages {
+			stage.flushWithoutQueueCheck(ctx)
+		}
+		return
+	}
+
+	items, err := d.queueStore.List(ctx, queueName)
+	if err != nil {
+		logger.Warn(ctx, "Failed to verify queued items before updating worker conditions", tag.Error(err))
+		return
+	}
+	stagesByItemID := make(map[string]*queuedConditionStage, len(stages))
+	for _, stage := range stages {
+		if stage != nil {
+			stagesByItemID[stage.itemID] = stage
+		}
+	}
+	for _, item := range items {
+		stage, ok := stagesByItemID[item.ID()]
+		if !ok {
+			continue
+		}
+		runRef, err := item.Data()
+		if err != nil {
+			logger.Warn(ctx, "Failed to read queued item before updating worker conditions", tag.Error(err))
+			continue
+		}
+		if runRef == nil || *runRef != stage.runRef {
+			continue
+		}
+		stage.flushWithoutQueueCheck(ctx)
+	}
+}
+
+func workerAvailableInSnapshot(
+	records []dispatch.WorkerHeartbeatRecord,
+	now time.Time,
+	staleThreshold time.Duration,
+	dag *ir.DAG,
+	status *ir.DAGRunStatus,
+) (bool, []queuedConditionDef) {
+	targetWorkerID := ir.RetryAgentOwnerWorkerID(status, false)
+	healthyWorkers := 0
+	for _, record := range records {
+		if !dispatch.WorkerHeartbeatFresh(record, now, staleThreshold) {
+			continue
+		}
+		healthyWorkers++
+		if dispatch.WorkerHeartbeatMatches(record, dag.WorkerSelector, targetWorkerID) {
+			return true, nil
+		}
+	}
+	if healthyWorkers == 0 {
+		return false, noAvailableWorkerConditionDefs
+	}
+	return false, noMatchingWorkerConditionDefs
 }
 
 func dispatchAdmissionWaitingCondition(decision *dispatch.DispatchAdmissionDecision) []queuedConditionDef {

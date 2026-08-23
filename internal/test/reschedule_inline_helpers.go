@@ -4,10 +4,7 @@
 package test
 
 import (
-	"fmt"
 	"net/http"
-	"os"
-	"path/filepath"
 	"runtime"
 	"testing"
 	"time"
@@ -36,7 +33,7 @@ func rescheduleEventuallyTimeout(base time.Duration) time.Duration {
 	return SubprocessRunTimeout(base)
 }
 
-func CreateInlineDAGRunForReschedule(t *testing.T, server Server, dagName string, enqueue bool) (string, string) {
+func CreateInlineDAGRunForReschedule(t *testing.T, server Server, dagName string, enqueue bool) string {
 	t.Helper()
 
 	inlineSpec := `params:
@@ -88,12 +85,7 @@ steps:
 	require.NoError(t, err)
 	require.Equal(t, []string{"KEY=hello world", "COUNT=3"}, status.ParamsList)
 
-	location := dag.Location
-	if location == "" {
-		location = ExpectedInlineTempPath(dagName, dagRunID)
-	}
-
-	return dagRunID, location
+	return dagRunID
 }
 
 func AssertInlineRescheduledRunParams(t *testing.T, server Server, dagName, dagRunID string) {
@@ -153,10 +145,6 @@ func WaitForAttemptSnapshotWithDAG(t *testing.T, server Server, dagName, dagRunI
 	return attempt, dag
 }
 
-func ExpectedInlineTempPath(name, dagRunID string) string {
-	return filepath.Join(os.TempDir(), name, dagRunID, fmt.Sprintf("%s.yaml", name))
-}
-
 func ProcessQueuedInlineRun(t *testing.T, server Server, queueName string) {
 	t.Helper()
 
@@ -166,7 +154,7 @@ func ProcessQueuedInlineRun(t *testing.T, server Server, queueName string) {
 		server.DAGRunRepository,
 		server.ProcRepository,
 		scheduler.NewDAGExecutor(
-			coordinator.New(server.ServiceRegistry, coordinator.DefaultConfig()),
+			coordinator.New(server.ServiceRegistry, CoordinatorClientConfig(server.Config.Paths.DataDir)),
 			server.SubCmdBuilder,
 			server.Config.DefaultExecMode,
 			server.Config.Paths.BaseConfig,

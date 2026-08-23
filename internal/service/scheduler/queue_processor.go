@@ -23,6 +23,7 @@ import (
 
 const queueAgeWarningThreshold = 2 * time.Minute
 const queueProcessMinInterval = 3 * time.Second
+const maxConcurrentDispatchHandoffs = 8
 
 var (
 	errProcessorClosed              = errors.New("processor closed")
@@ -96,10 +97,13 @@ type QueueProcessor struct {
 	dagRunLeaseStore       dispatch.DAGRunLeaseStore
 	dispatchTaskStore      dispatch.DispatchTaskStore
 	dispatchAdmissionStore dispatch.DispatchAdmissionStore
+	workerHeartbeatStore   dispatch.WorkerHeartbeatStore
+	workerStaleAfter       time.Duration
 	dagExecutor            *DAGExecutor
 	isSuspended            IsSuspendedFunc
 	queues                 sync.Map // map[string]*queue
 	wakeUpCh               chan struct{}
+	dispatchHandoffs       chan struct{}
 	quit                   chan struct{}
 	wg                     sync.WaitGroup
 	stopOnce               sync.Once
@@ -160,6 +164,20 @@ func WithDAGRunLeaseStore(store dispatch.DAGRunLeaseStore) QueueProcessorOption 
 	}
 }
 
+// WithWorkerHeartbeatStore sets the shared worker heartbeat store.
+func WithWorkerHeartbeatStore(store dispatch.WorkerHeartbeatStore) QueueProcessorOption {
+	return func(p *QueueProcessor) {
+		p.workerHeartbeatStore = store
+	}
+}
+
+// WithWorkerHeartbeatStaleThreshold sets the worker heartbeat freshness threshold.
+func WithWorkerHeartbeatStaleThreshold(threshold time.Duration) QueueProcessorOption {
+	return func(p *QueueProcessor) {
+		p.workerStaleAfter = threshold
+	}
+}
+
 // WithDispatchTaskStore sets the shared distributed dispatch reservation store.
 func WithDispatchTaskStore(store dispatch.DispatchTaskStore) QueueProcessorOption {
 	return func(p *QueueProcessor) {
@@ -201,12 +219,14 @@ func NewQueueProcessor(
 		procRepository:   procRepository,
 		dagExecutor:      dagExecutor,
 		wakeUpCh:         make(chan struct{}, 1),
+		dispatchHandoffs: make(chan struct{}, maxConcurrentDispatchHandoffs),
 		quit:             make(chan struct{}),
 		// Seed prevTime in the past so Start()'s initial wake-up is not
 		// throttled by the minimum processing interval.
 		prevTime:            time.Now().Add(-queueProcessMinInterval),
 		backoffConfig:       DefaultBackoffConfig(),
 		leaseStaleThreshold: dagrun.DefaultStaleLeaseThreshold,
+		workerStaleAfter:    dispatch.DefaultStaleWorkerHeartbeatThreshold,
 		isSuspended:         func(context.Context, string) (bool, error) { return false, nil },
 	}
 
@@ -345,13 +365,27 @@ func (p *QueueProcessor) newQueueDispatcher() *queueDispatcher {
 		dagRunLeaseStore:       p.dagRunLeaseStore,
 		dispatchTaskStore:      p.dispatchTaskStore,
 		dispatchAdmissionStore: p.dispatchAdmissionStore,
+		workerHeartbeatStore:   p.workerHeartbeatStore,
+		workerStaleAfter:       p.workerStaleAfter,
 		dagExecutor:            p.dagExecutor,
 		isSuspended:            p.isSuspended,
 		backoffConfig:          p.backoffConfig,
 		leaseStaleThreshold:    p.leaseStaleThreshold,
 		isClosed:               p.isClosed,
 		wakeUp:                 p.wakeUp,
+		acquireDispatchHandoff: p.acquireDispatchHandoff,
 	})
+}
+
+func (p *QueueProcessor) acquireDispatchHandoff(ctx context.Context) (func(), bool) {
+	select {
+	case p.dispatchHandoffs <- struct{}{}:
+		return func() { <-p.dispatchHandoffs }, true
+	case <-ctx.Done():
+		return nil, false
+	case <-p.quit:
+		return nil, false
+	}
 }
 
 // ProcessQueueItems processes items in the specified queue.

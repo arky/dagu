@@ -11,6 +11,9 @@ import (
 
 // Config holds configuration for the coordinator client
 type Config struct {
+	// WorkspaceBundleDir is required when dispatching DAGs with file dependencies.
+	WorkspaceBundleDir string
+
 	// TLS configuration
 	Insecure      bool   // Use insecure connection (default: true)
 	CertFile      string // Client certificate

@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/cmn/backoff"
+	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
 	"github.com/dagucloud/dagu/v2/internal/dispatch"
@@ -341,17 +342,18 @@ func (cli *clientImpl) prepareTaskWorkspace(ctx context.Context, task *dispatch.
 	if err != nil {
 		return fmt.Errorf("load DAG for file dependency snapshot: %w", err)
 	}
-	seed, err := runtimeexec.PrepareDAGWorkspace(dag)
+	desc, archivePath, err := runtimeexec.PrepareDAGWorkspaceFile(dag, cli.config.WorkspaceBundleDir)
 	if err != nil {
 		return err
 	}
-	if seed == nil {
+	if desc == nil {
 		return nil
 	}
-	if err := cli.PutWorkspaceBundle(ctx, seed.Descriptor, seed.Archive); err != nil {
+	defer func() { _ = fileutil.Remove(archivePath) }()
+	if err := cli.putWorkspaceBundleFile(ctx, *desc, archivePath); err != nil {
 		return fmt.Errorf("upload DAG file dependencies: %w", err)
 	}
-	runtimeexec.WithWorkspaceBundle(seed.Descriptor)(task)
+	runtimeexec.WithWorkspaceBundle(*desc)(task)
 	return nil
 }
 
@@ -1539,6 +1541,23 @@ func (cli *clientImpl) PutWorkspaceBundle(ctx context.Context, desc workspacebun
 	if err := workspacebundle.Verify(data, desc.Digest); err != nil {
 		return err
 	}
+	return cli.putWorkspaceBundle(ctx, desc, int64(len(data)), func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(data)), nil
+	})
+}
+
+func (cli *clientImpl) putWorkspaceBundleFile(ctx context.Context, desc workspacebundle.Descriptor, archivePath string) error {
+	return cli.putWorkspaceBundle(ctx, desc, desc.Size, func() (io.ReadCloser, error) {
+		return os.Open(archivePath) //nolint:gosec // archivePath is created by PrepareDAGWorkspaceFile.
+	})
+}
+
+func (cli *clientImpl) putWorkspaceBundle(
+	ctx context.Context,
+	desc workspacebundle.Descriptor,
+	size int64,
+	open func() (io.ReadCloser, error),
+) error {
 	members, err := cli.getCoordinatorMembers(ctx)
 	if err != nil {
 		return err
@@ -1567,12 +1586,21 @@ func (cli *clientImpl) PutWorkspaceBundle(ctx context.Context, desc workspacebun
 			continue
 		}
 
+		reader, err := open()
+		if err != nil {
+			errs = append(errs, fmt.Errorf("open workspace bundle for coordinator %q: %w", member.ID, err))
+			continue
+		}
 		callCtx, cancel = context.WithTimeout(ctx, cli.config.RequestTimeout)
-		err = putWorkspaceBundleToMember(callCtx, memberClient, desc, data)
+		err = putWorkspaceBundleToMember(callCtx, memberClient, desc, reader, size)
 		cancel()
+		closeErr := reader.Close()
 		if err != nil {
 			errs = append(errs, fmt.Errorf("upload workspace bundle to coordinator %q: %w", member.ID, err))
 			continue
+		}
+		if closeErr != nil {
+			errs = append(errs, fmt.Errorf("close workspace bundle for coordinator %q: %w", member.ID, closeErr))
 		}
 		satisfied++
 	}
@@ -1593,29 +1621,32 @@ func hasWorkspaceBundleInMember(ctx context.Context, client *client, digest stri
 	return resp != nil && resp.Exists, nil
 }
 
-func putWorkspaceBundleToMember(ctx context.Context, client *client, desc workspacebundle.Descriptor, data []byte) error {
+func putWorkspaceBundleToMember(ctx context.Context, client *client, desc workspacebundle.Descriptor, reader io.Reader, size int64) error {
 	stream, err := client.client.PutWorkspaceBundle(ctx)
 	if err != nil {
 		return fmt.Errorf("open workspace bundle upload stream: %w", err)
 	}
 	protoDesc := descriptorToProto(desc)
-	for offset, sequence := 0, uint64(0); offset < len(data) || sequence == 0; sequence++ {
-		end := min(offset+workspaceBundleChunkSize, len(data))
+	for remaining, sequence := size, uint64(0); remaining > 0 || sequence == 0; sequence++ {
+		chunkSize := min(remaining, int64(workspaceBundleChunkSize))
 		chunk := &coordinatorv1.WorkspaceBundleChunk{
 			Sequence: sequence,
-			IsFinal:  end == len(data),
+			IsFinal:  chunkSize == remaining,
 		}
 		if sequence == 0 {
 			chunk.Bundle = protoDesc
 		}
-		if offset < len(data) {
-			chunk.Data = data[offset:end]
+		if chunkSize > 0 {
+			chunk.Data = make([]byte, chunkSize)
+			if _, err := io.ReadFull(reader, chunk.Data); err != nil {
+				return fmt.Errorf("read workspace bundle chunk: %w", err)
+			}
 		}
 		if err := stream.Send(chunk); err != nil {
 			return fmt.Errorf("send workspace bundle chunk: %w", err)
 		}
-		offset = end
-		if len(data) == 0 {
+		remaining -= chunkSize
+		if size == 0 {
 			break
 		}
 	}
