@@ -6,11 +6,13 @@ package executor
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/runtime/workspacebundle"
+	"github.com/dagucloud/dagu/v2/internal/runtimeenv"
 )
 
 type workspaceSeedKey struct{}
@@ -25,9 +27,9 @@ func workspaceSeedFromContext(ctx context.Context) (WorkspaceSeed, bool) {
 	return seed, ok
 }
 
-// PrepareDAGWorkspace snapshots the files declared by a DAG for distributed execution.
-func PrepareDAGWorkspace(dag *ir.DAG) (*WorkspaceSeed, error) {
-	root, opts, err := dagWorkspacePackOptions(dag)
+// PrepareDAGWorkspace snapshots the files declared by a DAG.
+func PrepareDAGWorkspace(ctx context.Context, dag *ir.DAG) (*WorkspaceSeed, error) {
+	root, opts, err := dagWorkspacePackOptions(ctx, dag)
 	if err != nil || opts == nil {
 		return nil, err
 	}
@@ -39,8 +41,8 @@ func PrepareDAGWorkspace(dag *ir.DAG) (*WorkspaceSeed, error) {
 }
 
 // PrepareDAGWorkspaceFile snapshots declared files into a staged archive under bundleDir.
-func PrepareDAGWorkspaceFile(dag *ir.DAG, bundleDir string) (*workspacebundle.Descriptor, string, error) {
-	root, opts, err := dagWorkspacePackOptions(dag)
+func PrepareDAGWorkspaceFile(ctx context.Context, dag *ir.DAG, bundleDir string) (*workspacebundle.Descriptor, string, error) {
+	root, opts, err := dagWorkspacePackOptions(ctx, dag)
 	if err != nil || opts == nil {
 		return nil, "", err
 	}
@@ -54,27 +56,73 @@ func PrepareDAGWorkspaceFile(dag *ir.DAG, bundleDir string) (*workspacebundle.De
 	return descriptor, archivePath, nil
 }
 
-func dagWorkspacePackOptions(dag *ir.DAG) (string, *workspacebundle.PackOptions, error) {
+func dagWorkspacePackOptions(ctx context.Context, dag *ir.DAG) (string, *workspacebundle.PackOptions, error) {
 	includes := dagFileDependencies(dag)
 	if len(includes) == 0 {
 		return "", nil, nil
-	}
-	if dag == nil || strings.TrimSpace(dag.SourceFile) == "" {
-		return "", nil, fmt.Errorf("DAG file dependencies require a source file")
 	}
 	if dag.YamlData == nil {
 		return "", nil, fmt.Errorf("DAG file dependencies require the dispatched definition")
 	}
 
-	sourceFile, err := filepath.Abs(dag.SourceFile)
-	if err != nil {
-		return "", nil, fmt.Errorf("resolve DAG source file %q: %w", dag.SourceFile, err)
+	var sourceFile string
+	if strings.TrimSpace(dag.SourceFile) != "" {
+		var err error
+		sourceFile, err = filepath.Abs(dag.SourceFile)
+		if err != nil {
+			return "", nil, fmt.Errorf("resolve DAG source file %q: %w", dag.SourceFile, err)
+		}
 	}
-	return filepath.Dir(sourceFile), &workspacebundle.PackOptions{
-		DAGPath:  filepath.Base(sourceFile),
+	root := dag.WorkingDir
+	if strings.TrimSpace(root) == "" {
+		if sourceFile == "" {
+			return "", nil, fmt.Errorf("DAG file dependencies require a source file or working directory")
+		}
+		root = filepath.Dir(sourceFile)
+	} else {
+		var err error
+		root, err = runtimeenv.ResolveWorkingDir(ctx, dag)
+		if err != nil {
+			return "", nil, fmt.Errorf("resolve DAG working directory %q: %w", dag.WorkingDir, err)
+		}
+	}
+	dagPath, err := workspaceDAGPath(root, sourceFile)
+	if err != nil {
+		return "", nil, err
+	}
+	return root, &workspacebundle.PackOptions{
+		DAGPath:  dagPath,
 		DAGData:  dag.YamlData,
 		Includes: includes,
 	}, nil
+}
+
+func workspaceDAGPath(root, sourceFile string) (string, error) {
+	if sourceFile != "" && workspacebundle.IsPathWithin(root, sourceFile) {
+		rel, err := filepath.Rel(root, sourceFile)
+		if err != nil {
+			return "", fmt.Errorf("resolve workspace DAG path: %w", err)
+		}
+		normalized, err := workspacebundle.NormalizeRelativePath(rel)
+		if err != nil {
+			return "", fmt.Errorf("normalize workspace DAG path: %w", err)
+		}
+		return normalized, nil
+	}
+
+	for suffix := 0; ; suffix++ {
+		name := ".dagu-workflow.yaml"
+		if suffix > 0 {
+			name = fmt.Sprintf(".dagu-workflow-%d.yaml", suffix)
+		}
+		_, err := os.Lstat(filepath.Join(root, name))
+		if os.IsNotExist(err) {
+			return name, nil
+		}
+		if err != nil {
+			return "", fmt.Errorf("inspect workspace DAG path %q: %w", name, err)
+		}
+	}
 }
 
 func dagFileDependencies(dag *ir.DAG) []string {

@@ -745,10 +745,15 @@ func TestExecution_FileDependencies(t *testing.T) {
 		dependencyPath    = "fixtures/message.txt"
 		dependencyContent = "dependency from coordinator"
 	)
+	defaultRoot := t.TempDir()
+	dependencyRoot := t.TempDir()
 
-	f := newTestFixture(t, `
+	f := newTestFixture(t, fmt.Sprintf(`
 type: graph
 name: file-dependency-worker-test
+params:
+  DEPENDENCY_ROOT: %q
+working_dir: ${params.DEPENDENCY_ROOT}
 worker_selector:
   test: "true"
 steps:
@@ -759,10 +764,10 @@ steps:
     with:
       path: `+dependencyPath+`
     output: CONTENT
-`, withWorkerCount(0))
+`, defaultRoot), withWorkerCount(0))
 	defer f.cleanup()
 
-	sourceDependency := filepath.Join(filepath.Dir(f.dagWrapper.SourceFile), filepath.FromSlash(dependencyPath))
+	sourceDependency := filepath.Join(dependencyRoot, filepath.FromSlash(dependencyPath))
 	require.NoError(t, os.MkdirAll(filepath.Dir(sourceDependency), 0o750))
 	require.NoError(t, os.WriteFile(sourceDependency, []byte(dependencyContent), 0o600))
 
@@ -778,7 +783,7 @@ steps:
 			return true
 		}
 	}
-	require.NoError(t, f.enqueue())
+	require.NoError(t, f.enqueueWithParams("DEPENDENCY_ROOT="+dependencyRoot))
 	f.waitForQueued()
 	f.startScheduler(30 * time.Second)
 	f.requireEventuallyNoSchedulerError(
