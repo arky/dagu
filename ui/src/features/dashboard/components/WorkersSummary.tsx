@@ -166,6 +166,11 @@ function WorkersSummary({
                     <div className="flex flex-wrap gap-1">
                       {worker.labels &&
                         Object.entries(worker.labels)
+                          .sort(
+                            ([keyA], [keyB]) =>
+                              Number(keyA === 'os' || keyA === 'arch') -
+                              Number(keyB === 'os' || keyB === 'arch')
+                          )
                           .slice(0, 2)
                           .map(([key, value]) => (
                             <span
