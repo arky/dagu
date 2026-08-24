@@ -39,3 +39,7 @@ func TestStartAllCommand(t *testing.T) {
 		})
 	})
 }
+
+func TestStartAllSecondInterruptTerminatesBlockedCleanup(t *testing.T) {
+	assertSecondInterruptTerminatesBlockedCleanup(t, "start-all", "All services stopped gracefully")
+}

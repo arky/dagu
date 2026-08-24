@@ -5,11 +5,13 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os/signal"
 	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/agentsession"
 	"github.com/dagucloud/dagu/v2/internal/cmn/config"
@@ -55,6 +57,8 @@ Example:
 
 var serverFlags = []commandLineFlag{dagsFlag, hostFlag, portFlag, tunnelFlag, tunnelTokenFlag, tunnelFunnelFlag, tunnelHTTPSFlag}
 
+const localAgentSessionShutdownTimeout = 10 * time.Second
+
 func newServer(ctx *Context, rs *resource.Service, stores frontend.Stores, opts ...frontend.ServerOption) (*frontend.Server, error) {
 	coordinatorClient, err := ctx.NewCoordinatorClient()
 	if err != nil {
@@ -94,19 +98,30 @@ func runServer(ctx *Context, _ []string, serverOpts ...frontend.ServerOption) er
 	serviceCtx := ctx.WithContext(signalCtx)
 	openCodeHost := opencodehost.New(signalCtx, ctx.Config.OpenCode)
 	cleanupCancel, cleanupDone := startLocalAgentSessionCleanup(signalCtx, ctx.Persistence, openCodeHost)
+	var tunnelService *tunnel.Service
+	var resourceService *resource.Service
 	defer func() {
-		cleanupCancel()
-		<-cleanupDone
-		if err := openCodeHost.Close(ctx); err != nil {
-			logger.Error(ctx, "Failed to stop OpenCode host", tag.Error(err))
+		stop()
+		if resourceService != nil {
+			if err := resourceService.Stop(ctx); err != nil {
+				logger.Error(ctx, "Failed to stop resource service", tag.Error(err))
+			}
+		}
+		if tunnelService != nil {
+			if err := tunnelService.Stop(ctx); err != nil {
+				logger.Error(ctx, "Failed to stop tunnel service", tag.Error(err))
+			}
+		}
+		if ctx.LicenseManager != nil {
+			ctx.LicenseManager.Stop()
+		}
+		shutdownCtx, shutdownCancel := localAgentSessionShutdownContext(ctx)
+		defer shutdownCancel()
+		if err := stopLocalAgentSessionCleanup(shutdownCtx, cleanupCancel, cleanupDone, openCodeHost); err != nil {
+			logger.Error(ctx, "Failed to stop local agent session services", tag.Error(err))
 		}
 	}()
 	serverOpts = append(serverOpts, frontend.WithAPIOption(apiv1.WithOpenCodeHost(openCodeHost)))
-
-	// Stop license manager on shutdown
-	if ctx.LicenseManager != nil {
-		defer ctx.LicenseManager.Stop()
-	}
 
 	stores, err := frontendfile.NewStores(serviceCtx, serviceCtx.Config, serviceCtx.backend)
 	if err != nil {
@@ -120,27 +135,15 @@ func runServer(ctx *Context, _ []string, serverOpts ...frontend.ServerOption) er
 	)
 
 	// Initialize tunnel service if enabled
-	tunnelService, err := initTunnelService(ctx.Config)
+	tunnelService, err = initTunnelService(ctx.Config)
 	if err != nil {
 		return fmt.Errorf("failed to initialize tunnel: %w", err)
 	}
-	if tunnelService != nil {
-		defer func() {
-			if err := tunnelService.Stop(ctx); err != nil {
-				logger.Error(ctx, "Failed to stop tunnel service", tag.Error(err))
-			}
-		}()
-	}
 
-	// Initialize resource monitoring service (defer cleanup, but don't start yet).
+	// Initialize resource monitoring service, but don't start it yet.
 	// Resource monitoring must start AFTER server init to avoid race condition
 	// with auth provider initialization (gopsutil conflicts with net/http dial).
-	resourceService := resource.NewService(ctx.Config)
-	defer func() {
-		if err := resourceService.Stop(ctx); err != nil {
-			logger.Error(ctx, "Failed to stop resource service", tag.Error(err))
-		}
-	}()
+	resourceService = resource.NewService(ctx.Config)
 
 	serverOpts = append([]frontend.ServerOption(nil), serverOpts...)
 	if tunnelService != nil {
@@ -173,7 +176,9 @@ func runServer(ctx *Context, _ []string, serverOpts ...frontend.ServerOption) er
 		}
 	}
 
-	if err := server.Serve(serviceCtx); err != nil {
+	err = server.Serve(serviceCtx)
+	stop() // Restore default signal handling while deferred cleanup runs.
+	if err != nil {
 		return fmt.Errorf("failed to start server: %w", err)
 	}
 
@@ -198,6 +203,26 @@ func startLocalAgentSessionCleanup(ctx context.Context, persistence Persistence,
 			})
 	}()
 	return cancel, done
+}
+
+func stopLocalAgentSessionCleanup(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	done <-chan struct{},
+	host *opencodehost.Host,
+) error {
+	cancel()
+	var cleanupErr error
+	select {
+	case <-done:
+	case <-ctx.Done():
+		cleanupErr = fmt.Errorf("wait for agent session cleanup: %w", ctx.Err())
+	}
+	return errors.Join(cleanupErr, host.Close(ctx))
+}
+
+func localAgentSessionShutdownContext(parent context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(parent), localAgentSessionShutdownTimeout)
 }
 
 // initTunnelService creates and returns a tunnel service based on configuration.
