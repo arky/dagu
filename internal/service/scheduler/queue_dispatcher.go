@@ -67,12 +67,37 @@ type queueDispatchBatch struct {
 	maxConcurrency        int
 	aliveCount            int
 	nonAdmissionOccupancy int
+	retryScan             bool
+}
+
+type queueCapacityAvailability uint8
+
+const (
+	queueCapacityAvailable queueCapacityAvailability = iota
+	queueLocalStateUnavailable
+	queueDistributedStateUnavailable
+	queueDispatchStateUnavailable
+)
+
+type queueCapacityGeneration struct {
+	maxConcurrency           int
+	localAliveCount          int
+	distributedAliveCount    int
+	inflightCount            int
+	outstandingDispatchCount int
+	availability             queueCapacityAvailability
+}
+
+type queueCapacitySnapshot struct {
+	queueCapacityGeneration
+	err error
 }
 
 type workerHeartbeatSnapshot struct {
-	records []dispatch.WorkerHeartbeatRecord
-	err     error
-	loaded  bool
+	records    []dispatch.WorkerHeartbeatRecord
+	observedAt time.Time
+	err        error
+	loaded     bool
 }
 
 func (s *workerHeartbeatSnapshot) load(
@@ -81,6 +106,7 @@ func (s *workerHeartbeatSnapshot) load(
 ) ([]dispatch.WorkerHeartbeatRecord, error) {
 	if !s.loaded {
 		s.loaded = true
+		s.observedAt = time.Now().UTC()
 		s.records, s.err = store.List(ctx)
 		if s.err != nil {
 			logger.Error(ctx, "Failed to list worker heartbeats", tag.Error(s.err))
@@ -563,67 +589,95 @@ func (d *queueDispatcher) selectDispatchBatch(
 	ctx context.Context,
 	queueName string,
 	items []queuedomain.QueuedItemData,
-	maxConcurrency int,
-	inflightCount int,
+	capacity queueCapacitySnapshot,
+	workerSnapshot *workerHeartbeatSnapshot,
 ) (queueDispatchBatch, error) {
-	localAliveCount, err := d.procRepository.CountAlive(ctx, queueName)
-	if err != nil {
-		logger.Error(ctx, "Failed to count alive processes", tag.Error(err), tag.Queue(queueName))
+	if capacity.err != nil {
 		d.recordQueueStateUnavailableConditions(ctx, queueName, items)
-		return queueDispatchBatch{}, fmt.Errorf("count alive processes: %w", err)
+		return queueDispatchBatch{}, capacity.err
 	}
 
-	distributedAliveCount, err := d.countActiveDistributedRuns(ctx, queueName)
-	if err != nil {
-		logger.Error(ctx, "Failed to count distributed leases", tag.Error(err), tag.Queue(queueName))
-		d.recordQueueStateUnavailableConditions(ctx, queueName, items)
-		return queueDispatchBatch{}, fmt.Errorf("count distributed leases: %w", err)
-	}
-	aliveCount := localAliveCount + distributedAliveCount
-	outstandingDispatchCount := 0
-	if d.dispatchAdmissionStore == nil {
-		outstandingDispatchCount, err = d.countOutstandingDispatchReservations(ctx, queueName)
-		if err != nil {
-			logger.Error(ctx, "Failed to count outstanding distributed dispatch reservations", tag.Error(err), tag.Queue(queueName))
-			d.recordQueueStateUnavailableConditions(ctx, queueName, items)
-			return queueDispatchBatch{}, fmt.Errorf("count outstanding distributed dispatch reservations: %w", err)
-		}
-	}
-	nonAdmissionOccupancy := localAliveCount + inflightCount
-	freeSlots := maxConcurrency - aliveCount - inflightCount - outstandingDispatchCount
+	aliveCount := capacity.localAliveCount + capacity.distributedAliveCount
+	nonAdmissionOccupancy := capacity.localAliveCount + capacity.inflightCount
+	freeSlots := capacity.maxConcurrency - aliveCount - capacity.inflightCount - capacity.outstandingDispatchCount
 
 	logger.Debug(ctx, "Queue capacity check",
-		tag.MaxConcurrency(maxConcurrency),
+		tag.MaxConcurrency(capacity.maxConcurrency),
 		tag.Alive(aliveCount),
-		slog.Int("outstanding-dispatches", outstandingDispatchCount),
+		slog.Int("outstanding-dispatches", capacity.outstandingDispatchCount),
 		tag.Count(freeSlots),
 	)
 
 	if freeSlots <= 0 {
 		logger.Debug(ctx, "Max concurrency reached",
-			tag.MaxConcurrency(maxConcurrency),
+			tag.MaxConcurrency(capacity.maxConcurrency),
 			tag.Alive(aliveCount),
 		)
-		d.recordCapacityUnavailableConditions(ctx, queueName, items, outstandingDispatchCount > 0)
+		d.recordCapacityUnavailableConditions(ctx, queueName, items, capacity.outstandingDispatchCount > 0)
 		return queueDispatchBatch{}, nil
 	}
 
-	runnableItems, err := d.selectRunnableQueueItemsInQueue(ctx, queueName, items, freeSlots)
+	runnableItems, retryScan, err := d.selectRunnableQueueItemsInQueue(ctx, queueName, items, freeSlots, workerSnapshot)
 	if err != nil {
 		logger.Error(ctx, "Failed to select runnable queue items", tag.Error(err), tag.Queue(queueName))
 		return queueDispatchBatch{}, fmt.Errorf("select runnable queue items: %w", err)
 	}
 	if len(runnableItems) == 0 {
 		logger.Debug(ctx, "No queue items eligible for a new dispatch attempt")
-		return queueDispatchBatch{}, nil
+		return queueDispatchBatch{retryScan: retryScan}, nil
 	}
 
 	return queueDispatchBatch{
 		items:                 runnableItems,
-		maxConcurrency:        maxConcurrency,
+		maxConcurrency:        capacity.maxConcurrency,
 		aliveCount:            aliveCount,
 		nonAdmissionOccupancy: nonAdmissionOccupancy,
+		retryScan:             retryScan,
 	}, nil
+}
+
+func (d *queueDispatcher) queueCapacity(
+	ctx context.Context,
+	queueName string,
+	maxConcurrency int,
+	inflightCount int,
+) queueCapacitySnapshot {
+	capacity := queueCapacitySnapshot{queueCapacityGeneration: queueCapacityGeneration{
+		maxConcurrency: maxConcurrency,
+		inflightCount:  inflightCount,
+	}}
+
+	if d.procRepository != nil {
+		localAliveCount, err := d.procRepository.CountAlive(ctx, queueName)
+		if err != nil {
+			logger.Error(ctx, "Failed to count alive processes", tag.Error(err), tag.Queue(queueName))
+			capacity.availability = queueLocalStateUnavailable
+			capacity.err = fmt.Errorf("count alive processes: %w", err)
+			return capacity
+		}
+		capacity.localAliveCount = localAliveCount
+	}
+
+	distributedAliveCount, err := d.countActiveDistributedRuns(ctx, queueName)
+	if err != nil {
+		logger.Error(ctx, "Failed to count distributed leases", tag.Error(err), tag.Queue(queueName))
+		capacity.availability = queueDistributedStateUnavailable
+		capacity.err = fmt.Errorf("count distributed leases: %w", err)
+		return capacity
+	}
+	capacity.distributedAliveCount = distributedAliveCount
+
+	if d.dispatchAdmissionStore == nil {
+		outstandingDispatchCount, err := d.countOutstandingDispatchReservations(ctx, queueName)
+		if err != nil {
+			logger.Error(ctx, "Failed to count outstanding distributed dispatch reservations", tag.Error(err), tag.Queue(queueName))
+			capacity.availability = queueDispatchStateUnavailable
+			capacity.err = fmt.Errorf("count outstanding distributed dispatch reservations: %w", err)
+			return capacity
+		}
+		capacity.outstandingDispatchCount = outstandingDispatchCount
+	}
+	return capacity
 }
 
 func (d *queueDispatcher) dispatchQueuedItem(
@@ -1218,7 +1272,8 @@ func (d *queueDispatcher) selectRunnableQueueItems(
 	items []queuedomain.QueuedItemData,
 	freeSlots int,
 ) ([]queuedomain.QueuedItemData, error) {
-	return d.selectRunnableQueueItemsInQueue(ctx, "", items, freeSlots)
+	runnable, _, err := d.selectRunnableQueueItemsInQueue(ctx, "", items, freeSlots, &workerHeartbeatSnapshot{})
+	return runnable, err
 }
 
 func (d *queueDispatcher) selectRunnableQueueItemsInQueue(
@@ -1226,13 +1281,14 @@ func (d *queueDispatcher) selectRunnableQueueItemsInQueue(
 	queueName string,
 	items []queuedomain.QueuedItemData,
 	freeSlots int,
-) ([]queuedomain.QueuedItemData, error) {
+	workerSnapshot *workerHeartbeatSnapshot,
+) ([]queuedomain.QueuedItemData, bool, error) {
 	if freeSlots <= 0 {
-		return nil, nil
+		return nil, false, nil
 	}
 
 	runnable := make([]queuedomain.QueuedItemData, 0, min(freeSlots, len(items)))
-	workerSnapshot := workerHeartbeatSnapshot{}
+	retryScan := false
 	var workerConditionStages []*queuedConditionStage
 	defer func() {
 		flushQueuedConditionStages(ctx, workerConditionStages)
@@ -1244,12 +1300,13 @@ func (d *queueDispatcher) selectRunnableQueueItemsInQueue(
 		runRef, err := item.Data()
 		if err != nil {
 			logger.Error(ctx, "Failed to get item data while selecting runnable queue items", tag.Error(err))
+			retryScan = true
 			continue
 		}
 		if d.dispatchAdmissionStore == nil && d.dispatchTaskStore != nil {
 			reserved, err := d.hasOutstandingDispatchReservation(ctx, *runRef)
 			if err != nil {
-				return nil, err
+				return nil, retryScan, err
 			}
 			if reserved {
 				conditionStage := d.newQueuedConditionStageFromItem(ctx, queueName, item)
@@ -1264,7 +1321,7 @@ func (d *queueDispatcher) selectRunnableQueueItemsInQueue(
 		if d.workerHeartbeatStore != nil {
 			recordCondition := len(workerConditionStages) < queuedConditionRefreshBatchLimit
 			eligible, conditionStage := d.queueItemHasEligibleWorker(
-				ctx, queueName, item, *runRef, &workerSnapshot, recordCondition,
+				ctx, queueName, item, *runRef, workerSnapshot, recordCondition,
 			)
 			if !eligible {
 				if conditionStage != nil {
@@ -1276,7 +1333,7 @@ func (d *queueDispatcher) selectRunnableQueueItemsInQueue(
 		runnable = append(runnable, item)
 	}
 
-	return runnable, nil
+	return runnable, retryScan, nil
 }
 
 func (d *queueDispatcher) queueItemHasEligibleWorker(
@@ -1305,7 +1362,7 @@ func (d *queueDispatcher) queueItemHasEligibleWorker(
 	if err != nil {
 		conditionDefs = assignmentUnavailableConditionDefs
 	} else {
-		available, defs := workerAvailableInSnapshot(records, time.Now().UTC(), d.workerStaleAfter, dag, status)
+		available, defs := workerAvailableInSnapshot(records, workerSnapshot.observedAt, d.workerStaleAfter, dag, status)
 		if available {
 			return true, nil
 		}

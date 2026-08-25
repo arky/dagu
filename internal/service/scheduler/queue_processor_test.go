@@ -10,7 +10,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -357,6 +359,54 @@ func TestQueueProcessor_CountsFreshDistributedRunsAgainstQueueConcurrency(t *tes
 	assert.Contains(t, f.logs(), "Max concurrency reached")
 }
 
+func TestQueueProcessor_RechecksDistributedCapacityAfterLeaseRelease(t *testing.T) {
+	f := newQueueFixture(t).withDAG("distributed-recheck-dag", 1).
+		withProcessor(config.Queues{}, WithLeaseStaleThreshold(freshDistributedTestThreshold)).
+		simulateQueue(1, false)
+	dispatcher := &mockDispatcher{}
+	f.processor.dagExecutor = NewDAGExecutor(dispatcher, nil, config.ExecutionModeDistributed, "")
+
+	const activeAttemptKey = "active-attempt"
+	require.NoError(t, f.leaseStore.Upsert(f.ctx, dispatch.DAGRunLease{
+		AttemptKey:      activeAttemptKey,
+		QueueName:       f.dag.Name,
+		WorkerID:        "worker-1",
+		LastHeartbeatAt: time.Now().UTC().UnixMilli(),
+	}))
+	f.enqueueRuns(1)
+
+	f.processor.ProcessQueueItems(f.ctx, f.dag.Name)
+	require.Zero(t, dispatcher.callCount.Load())
+	select {
+	case <-f.processor.wakeUpCh:
+	default:
+		t.Fatal("parked distributed queue did not schedule a capacity recheck")
+	}
+
+	require.NoError(t, f.leaseStore.Delete(f.ctx, activeAttemptKey))
+	f.processor.ProcessQueueItems(f.ctx, f.dag.Name)
+	assert.Equal(t, int32(1), dispatcher.callCount.Load())
+}
+
+func TestQueueProcessor_DefersUnchangedDistributedDispatchFailure(t *testing.T) {
+	f := newQueueFixture(t).withDAG("distributed-dispatch-error-dag", 1).
+		withProcessor(config.Queues{}).
+		simulateQueue(1, false)
+	dispatcher := &mockDispatcher{errFunc: func(int32) error {
+		return errors.New("dispatch unavailable")
+	}}
+	f.processor.dagExecutor = NewDAGExecutor(dispatcher, nil, config.ExecutionModeDistributed, "")
+	f.enqueueRuns(1)
+
+	f.processor.ProcessQueueItems(f.ctx, f.dag.Name)
+	f.processor.ProcessQueueItems(f.ctx, f.dag.Name)
+
+	assert.Equal(t, int32(1), dispatcher.callCount.Load())
+	items, err := f.queueStore.List(f.ctx, f.dag.Name)
+	require.NoError(t, err)
+	require.Len(t, items, 1)
+}
+
 func TestQueueProcessor_ProcessQueueItems_FailsClosedOnLeaseCountError(t *testing.T) {
 	f := newQueueFixture(t).withDAG("distributed-count-error-dag", 1).
 		withProcessor(config.Queues{}).
@@ -634,15 +684,239 @@ func TestQueueProcessorRestartsBoundedScanAfterCursorInvalidation(t *testing.T) 
 
 	queueStore := &invalidatingCursorQueueStore{}
 	processor := NewQueueProcessor(queueStore, nil, nil, nil, config.Queues{})
-	page, err := processor.listQueueScanPage(t.Context(), "main", &queue{})
+	page, err := processor.listQueueScanPage(t.Context(), "main", "")
 	require.NoError(t, err)
 	require.Len(t, page.Items, 1)
 	assert.Equal(t, "new-head", page.Items[0].ID())
 }
 
+func TestQueueProcessorParksCompletedBlockedScanUntilGenerationChanges(t *testing.T) {
+	t.Parallel()
+
+	queueStore := &pagedQueueScanStore{itemCount: queueScanItemLimit + 1}
+	queueStore.revision.Store(1)
+	procRepository := &queueScanProcRepository{alive: 1}
+	processor := NewQueueProcessor(queueStore, nil, procRepository, nil, config.Queues{
+		Config: []config.QueueConfig{{Name: "main", MaxActiveRuns: 1}},
+	})
+
+	processor.ProcessQueueItems(t.Context(), "main")
+	assert.Equal(t, int32(2), queueStore.scanCalls.Load())
+	select {
+	case <-processor.wakeUpCh:
+	default:
+		t.Fatal("incomplete scan did not schedule its next page")
+	}
+
+	processor.ProcessQueueItems(t.Context(), "main")
+	assert.Equal(t, int32(4), queueStore.scanCalls.Load())
+	select {
+	case <-processor.wakeUpCh:
+	default:
+		t.Fatal("completed blocked scan did not schedule a state recheck")
+	}
+
+	processor.ProcessQueueItems(t.Context(), "main")
+	assert.Equal(t, int32(4), queueStore.scanCalls.Load(), "unchanged parked queue should not be scanned again")
+	select {
+	case <-processor.wakeUpCh:
+	default:
+		t.Fatal("unchanged parked queue did not schedule another state recheck")
+	}
+
+	procRepository.setAlive(2)
+	processor.ProcessQueueItems(t.Context(), "main")
+	assert.Equal(t, int32(6), queueStore.scanCalls.Load(), "capacity changes should restart the scan")
+}
+
+func TestQueueProcessorParksQueueStateErrorsUntilGenerationChanges(t *testing.T) {
+	t.Parallel()
+
+	queueStore := &pagedQueueScanStore{itemCount: 1}
+	queueStore.revision.Store(1)
+	procRepository := &queueScanProcRepository{err: errors.New("process store unavailable")}
+	processor := NewQueueProcessor(queueStore, nil, procRepository, nil, config.Queues{
+		Config: []config.QueueConfig{{Name: "main", MaxActiveRuns: 1}},
+	})
+
+	processor.ProcessQueueItems(t.Context(), "main")
+	assert.Equal(t, int32(1), queueStore.scanCalls.Load())
+	select {
+	case <-processor.wakeUpCh:
+	default:
+		t.Fatal("queue state error did not schedule a state recheck")
+	}
+
+	processor.ProcessQueueItems(t.Context(), "main")
+	assert.Equal(t, int32(1), queueStore.scanCalls.Load(), "unchanged queue state error should stay parked")
+	select {
+	case <-processor.wakeUpCh:
+	default:
+		t.Fatal("unchanged queue state error did not schedule another state recheck")
+	}
+
+	procRepository.setState(1, nil)
+	processor.ProcessQueueItems(t.Context(), "main")
+	assert.Equal(t, int32(2), queueStore.scanCalls.Load(), "queue state recovery should restart the scan")
+}
+
+func TestWorkerEligibilityGenerationTracksRoutingChanges(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now().UTC()
+	record := dispatch.WorkerHeartbeatRecord{
+		WorkerID:        "worker-1",
+		Labels:          map[string]string{"region": "east", "type": "gpu"},
+		Stats:           &dispatch.WorkerStats{BusyPollers: 1},
+		LastHeartbeatAt: now.UnixMilli(),
+	}
+	base := (&workerHeartbeatSnapshot{records: []dispatch.WorkerHeartbeatRecord{record}, observedAt: now}).generation(true, time.Minute)
+
+	updatedHeartbeat := record
+	updatedHeartbeat.LastHeartbeatAt = now.Add(time.Second).UnixMilli()
+	updatedHeartbeat.Stats = &dispatch.WorkerStats{BusyPollers: 2}
+	stable := (&workerHeartbeatSnapshot{records: []dispatch.WorkerHeartbeatRecord{updatedHeartbeat}, observedAt: now}).generation(true, time.Minute)
+	assert.Equal(t, base, stable, "heartbeat timestamps and worker stats do not affect routing")
+
+	changedLabels := record
+	changedLabels.Labels = map[string]string{"region": "west", "type": "gpu"}
+	labelsGeneration := (&workerHeartbeatSnapshot{records: []dispatch.WorkerHeartbeatRecord{changedLabels}, observedAt: now}).generation(true, time.Minute)
+	assert.NotEqual(t, base, labelsGeneration)
+
+	joinedGeneration := (&workerHeartbeatSnapshot{
+		records:    []dispatch.WorkerHeartbeatRecord{record, {WorkerID: "worker-2", LastHeartbeatAt: now.UnixMilli()}},
+		observedAt: now,
+	}).generation(true, time.Minute)
+	assert.NotEqual(t, base, joinedGeneration)
+
+	staleGeneration := (&workerHeartbeatSnapshot{records: []dispatch.WorkerHeartbeatRecord{record}, observedAt: now.Add(2 * time.Minute)}).generation(true, time.Minute)
+	assert.NotEqual(t, base, staleGeneration)
+}
+
+func TestQueueScanGenerationRestartsOnlyChangedQueue(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	first := &queue{}
+	second := &queue{}
+	base := queueScanGeneration{queueRevision: 1}
+	first.deferScan(base, now.Add(queueProcessFallbackInterval))
+	second.parkScan(base)
+
+	_, firstParked := first.scanPosition(queueScanGeneration{queueRevision: 2}, now)
+	_, secondParked := second.scanPosition(base, now)
+	assert.False(t, firstParked)
+	assert.True(t, secondParked)
+}
+
+func TestQueueScanDefersUnchangedGenerationUntilRetryDeadline(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	generation := queueScanGeneration{queueRevision: 1}
+	q := &queue{}
+	q.deferScan(generation, now.Add(queueProcessFallbackInterval))
+
+	_, parked := q.scanPosition(generation, now.Add(queueProcessFallbackInterval-time.Second))
+	assert.True(t, parked)
+
+	_, parked = q.scanPosition(generation, now.Add(queueProcessFallbackInterval))
+	assert.False(t, parked)
+}
+
+func TestQueueScanRetainsRetryAcrossPages(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	generation := queueScanGeneration{queueRevision: 1}
+	q := &queue{}
+	q.advanceScan(generation, "next-page", true)
+	q.finishScan(generation, false, now.Add(queueProcessFallbackInterval))
+
+	_, parked := q.scanPosition(generation, now.Add(queueProcessFallbackInterval-time.Second))
+	assert.True(t, parked)
+
+	_, parked = q.scanPosition(generation, now.Add(queueProcessFallbackInterval))
+	assert.False(t, parked)
+}
+
+func TestQueueProcessorRetriesUnreadableItemAfterFallback(t *testing.T) {
+	dagName := "unreadable-item-dag"
+	f := newQueueFixture(t).
+		withDAG(dagName, 1).
+		withProcessor(config.Queues{}).
+		simulateQueue(1, false)
+	f.enqueueRunWithTrigger("run-1", ir.TriggerTypeManual)
+	f.processor.dagExecutor = NewDAGExecutor(
+		nil,
+		launcher.NewSubCmdBuilder(&config.Config{
+			Paths: config.PathsConfig{Executable: filepath.Join(t.TempDir(), "missing-dagu")},
+		}),
+		config.ExecutionModeLocal,
+		"",
+	)
+
+	queueStore := &unreadableQueueScanStore{QueueStore: f.queueStore}
+	queueStore.unreadable.Store(true)
+	f.processor.queueStore = queueStore
+
+	f.processor.ProcessQueueItems(f.ctx, dagName)
+	assert.Equal(t, int32(1), queueStore.scanCalls.Load())
+
+	f.processor.ProcessQueueItems(f.ctx, dagName)
+	assert.Equal(t, int32(1), queueStore.scanCalls.Load(), "unreadable item should not be retried before the fallback deadline")
+
+	queueStore.unreadable.Store(false)
+	q := f.getQueue(dagName)
+	q.mu.Lock()
+	generation := q.scanGeneration
+	retryAt := q.scanRetryAt
+	q.mu.Unlock()
+	require.False(t, retryAt.IsZero())
+	_, parked := q.scanPosition(generation, retryAt)
+	require.False(t, parked)
+
+	f.processor.ProcessQueueItems(f.ctx, dagName)
+	assert.Equal(t, int32(2), queueStore.scanCalls.Load())
+	items, err := f.queueStore.List(f.ctx, dagName)
+	require.NoError(t, err)
+	assert.Empty(t, items)
+}
+
 type invalidatingCursorQueueStore struct {
 	queuedomain.QueueStore
 	calls int
+}
+
+type unreadableQueueScanStore struct {
+	queuedomain.QueueStore
+	unreadable atomic.Bool
+	scanCalls  atomic.Int32
+}
+
+func (s *unreadableQueueScanStore) ListCursor(
+	ctx context.Context,
+	queueName string,
+	cursor string,
+	limit int,
+) (pagination.CursorResult[queuedomain.QueuedItemData], error) {
+	page, err := s.QueueStore.ListCursor(ctx, queueName, cursor, limit)
+	s.scanCalls.Add(1)
+	if err != nil || !s.unreadable.Load() {
+		return page, err
+	}
+	for i, item := range page.Items {
+		page.Items[i] = unreadableQueuedItem{QueuedItemData: item}
+	}
+	return page, nil
+}
+
+type unreadableQueuedItem struct {
+	queuedomain.QueuedItemData
+}
+
+func (unreadableQueuedItem) Data() (*ir.DAGRunRef, error) {
+	return nil, errors.New("queue item temporarily unreadable")
 }
 
 func (s *invalidatingCursorQueueStore) ListCursor(
@@ -675,8 +949,82 @@ type blockingQueueScanStore struct {
 	release    chan struct{}
 }
 
+type pagedQueueScanStore struct {
+	queuedomain.QueueStore
+	revision  atomic.Int64
+	scanCalls atomic.Int32
+	itemCount int
+}
+
+func (s *pagedQueueScanStore) Revision(context.Context, string) (int64, error) {
+	return s.revision.Load(), nil
+}
+
+func (s *pagedQueueScanStore) ListCursor(
+	_ context.Context,
+	_ string,
+	cursor string,
+	limit int,
+) (pagination.CursorResult[queuedomain.QueuedItemData], error) {
+	s.scanCalls.Add(1)
+	start := 0
+	if cursor != "" {
+		var err error
+		start, err = strconv.Atoi(cursor)
+		if err != nil || start < 0 || start > s.itemCount {
+			return pagination.CursorResult[queuedomain.QueuedItemData]{}, pagination.ErrInvalidCursor
+		}
+	}
+	end := min(start+limit, s.itemCount)
+	items := make([]queuedomain.QueuedItemData, 0, end-start)
+	for i := start; i < end; i++ {
+		items = append(items, testQueuedItem{id: fmt.Sprintf("item-%03d", i)})
+	}
+	hasMore := end < s.itemCount
+	nextCursor := ""
+	if hasMore {
+		nextCursor = strconv.Itoa(end)
+	}
+	return pagination.CursorResult[queuedomain.QueuedItemData]{
+		Items:      items,
+		HasMore:    hasMore,
+		NextCursor: nextCursor,
+	}, nil
+}
+
+type queueScanProcRepository struct {
+	mu    sync.Mutex
+	alive int
+	err   error
+}
+
+func (s *queueScanProcRepository) CountAlive(context.Context, string) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.alive, s.err
+}
+
+func (s *queueScanProcRepository) IsRunAlive(context.Context, string, ir.DAGRunRef) (bool, error) {
+	return false, nil
+}
+
+func (s *queueScanProcRepository) setAlive(alive int) {
+	s.setState(alive, nil)
+}
+
+func (s *queueScanProcRepository) setState(alive int, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.alive = alive
+	s.err = err
+}
+
 func (s *blockingQueueScanStore) QueueList(context.Context) ([]string, error) {
 	return append([]string(nil), s.queueNames...), nil
+}
+
+func (s *blockingQueueScanStore) Revision(context.Context, string) (int64, error) {
+	return 1, nil
 }
 
 func (s *blockingQueueScanStore) ListCursor(
@@ -737,15 +1085,19 @@ func TestQueueProcessor_SuspendedSchedulerManagedQueuedRunsAreAbortedAndDequeued
 
 func TestQueueProcessor_LeavesSchedulerManagedRunQueuedWhenSuspensionReadFails(t *testing.T) {
 	dagName := "suspension-read-error-dag"
+	var suspensionReads atomic.Int32
 	f := newQueueFixture(t).
 		withDAG(dagName, 1).
 		withProcessor(config.Queues{}, WithIsSuspended(func(context.Context, string) (bool, error) {
+			suspensionReads.Add(1)
 			return false, errors.New("read suspend flag")
 		})).
 		simulateQueue(1, false)
 
 	f.enqueueRunWithTrigger("run-1", ir.TriggerTypeScheduler)
 	f.processor.ProcessQueueItems(f.ctx, dagName)
+	f.processor.ProcessQueueItems(f.ctx, dagName)
+	assert.Equal(t, int32(1), suspensionReads.Load())
 
 	items, err := f.queueStore.List(f.ctx, dagName)
 	require.NoError(t, err)
