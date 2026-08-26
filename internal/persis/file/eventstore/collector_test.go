@@ -8,6 +8,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -50,6 +51,36 @@ func TestCollectorDrainOnceAppendsByHourAndDeduplicatesAcrossRestart(t *testing.
 
 	assertInboxCount(t, store.inboxDir, 0)
 	assertLogLineCount(t, filepath.Join(baseDir, "_2026032823.jsonl"), 1)
+}
+
+func TestCollectorDrainOncePreservesInboxAfterMalformedCommittedEvent(t *testing.T) {
+	t.Parallel()
+
+	baseDir := t.TempDir()
+	event := testEvent("evt-after-malformed", time.Date(2026, 3, 29, 12, 0, 0, 0, time.UTC))
+	validJSON := string(mustMarshalEvent(t, event))
+	malformedJSON := strings.Replace(
+		validJSON,
+		`"schema_version":`+strconv.Itoa(event.SchemaVersion),
+		`"schema_version":"bad"`,
+		1,
+	)
+	require.NotEqual(t, validJSON, malformedJSON)
+	writeCommittedEvents(t, baseDir, event.OccurredAt, [][]byte{[]byte(malformedJSON)})
+
+	store, err := New(baseDir)
+	require.NoError(t, err)
+	require.NoError(t, store.Emit(context.Background(), event))
+
+	collector, err := NewCollector(baseDir, 10)
+	require.NoError(t, err)
+	require.NoError(t, collector.loadSeenIDs())
+	_, seen := collector.seenIDs[event.ID]
+	require.False(t, seen)
+
+	require.NoError(t, collector.DrainOnce(context.Background()))
+	assertInboxCount(t, store.inboxDir, 0)
+	assertLogLineCount(t, filepath.Join(baseDir, "_2026032912.jsonl"), 2)
 }
 
 func TestCollectorDrainOnceQuarantinesMalformedInbox(t *testing.T) {
@@ -188,6 +219,44 @@ func TestCollectorLoadSeenIDsReadsLargeCommittedEventLine(t *testing.T) {
 	require.NoError(t, collector.loadSeenIDs())
 	_, ok := collector.seenIDs[event.ID]
 	require.True(t, ok)
+}
+
+func TestCollectorSeenIDAllocs(t *testing.T) {
+	const (
+		largeFieldCount   = 512
+		maxAllocationRate = 2
+	)
+
+	newCollector := func(data map[string]any) *Collector {
+		baseDir := t.TempDir()
+		event := testEvent("evt-allocs", time.Date(2026, 3, 29, 22, 0, 0, 0, time.UTC))
+		event.Data = data
+		writeCommittedEvents(t, baseDir, event.OccurredAt, [][]byte{mustMarshalEvent(t, event)})
+
+		collector, err := NewCollector(baseDir, 10)
+		require.NoError(t, err)
+		return collector
+	}
+
+	small := newCollector(map[string]any{"0": 0})
+	largeData := make(map[string]any, largeFieldCount)
+	for i := range largeFieldCount {
+		largeData[strconv.Itoa(i)] = i
+	}
+	large := newCollector(largeData)
+
+	var smallErr error
+	smallAllocs := testing.AllocsPerRun(5, func() {
+		smallErr = small.loadSeenIDs()
+	})
+	require.NoError(t, smallErr)
+
+	var largeErr error
+	largeAllocs := testing.AllocsPerRun(5, func() {
+		largeErr = large.loadSeenIDs()
+	})
+	require.NoError(t, largeErr)
+	require.LessOrEqual(t, largeAllocs, smallAllocs*maxAllocationRate)
 }
 
 func assertInboxCount(t *testing.T, dir string, count int) {

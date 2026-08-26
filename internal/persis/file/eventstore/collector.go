@@ -313,8 +313,12 @@ func (c *Collector) loadSeenIDsFromFile(filePath string) error {
 	lineNum := 0
 	for scanner.Scan() {
 		lineNum++
-		event := new(eventstore.Event)
-		if err := json.Unmarshal(scanner.Bytes(), event); err != nil {
+		// Deduplication only needs the ID, so historical payloads stay unmaterialized.
+		var event struct {
+			eventstore.Event
+			Data struct{} `json:"data"`
+		}
+		if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
 			slog.Warn("fileeventstore: skipping malformed committed event while loading seen-set",
 				slog.String("file", filePath),
 				slog.Int("line", lineNum),
