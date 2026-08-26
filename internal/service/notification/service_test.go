@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -25,7 +26,9 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	notificationmodel "github.com/dagucloud/dagu/v2/internal/notification"
 	"github.com/dagucloud/dagu/v2/internal/persis"
+	fileeventstore "github.com/dagucloud/dagu/v2/internal/persis/file/eventstore"
 	"github.com/dagucloud/dagu/v2/internal/service/chatbridge"
+	"github.com/dagucloud/dagu/v2/internal/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -276,6 +279,79 @@ func TestService_SendTestWebhookIncludesPayloadHeadersAndSignature(t *testing.T)
 	assert.Equal(t, "sha256="+hex.EncodeToString(mac.Sum(nil)), receivedSignature)
 	assert.Contains(t, string(receivedBody), `"dagName":"daily-report"`)
 	assert.Contains(t, string(receivedBody), `"dagRunId":"notification-test"`)
+}
+
+func TestService_DeliversLifecycleEvent(t *testing.T) {
+	t.Parallel()
+
+	smtpServer := newRecordingSMTPServer(t)
+
+	settings := mustNormalizeSettings(t, &notificationmodel.Settings{
+		DAGName: "daily-report",
+		Enabled: true,
+		Events:  []eventstore.EventType{eventstore.TypeDAGRunFailed},
+		Targets: []notificationmodel.Target{{
+			ID:      "email-1",
+			Type:    notificationmodel.ProviderEmail,
+			Enabled: true,
+			Email:   &notificationmodel.EmailTarget{To: []string{"ops@example.com"}},
+		}},
+	})
+	notificationStore := newMemoryStore(settings)
+	workspaceSettings, err := notificationmodel.NormalizeWorkspaceSettings(&notificationmodel.WorkspaceSettings{
+		SMTP: &notificationmodel.SMTPConfig{
+			Host: smtpServer.host,
+			Port: smtpServer.port,
+			From: "dagu@example.com",
+		},
+	}, "tester")
+	require.NoError(t, err)
+	require.NoError(t, notificationStore.SaveWorkspaceSettings(context.Background(), workspaceSettings))
+	svc := New(
+		notificationStore,
+		nil,
+		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+	)
+
+	eventStore, err := fileeventstore.New(t.TempDir())
+	require.NoError(t, err)
+	eventService := eventstore.New(eventStore)
+	cursor, err := eventService.DAGRunHeadCursor(context.Background())
+	require.NoError(t, err)
+	require.NoError(t, eventService.Emit(context.Background(), eventstore.NewDAGRunEvent(
+		eventstore.Source{Service: eventstore.SourceServiceScheduler},
+		eventstore.TypeDAGRunFailed,
+		&ir.DAGRunStatus{
+			Name:      "daily-report",
+			DAGRunID:  "run-1",
+			AttemptID: "attempt-1",
+			Status:    ir.Failed,
+			Error:     "boom",
+		},
+		nil,
+	)))
+
+	monitorConfig := chatbridge.DefaultNotificationMonitorConfig()
+	monitorConfig.BootstrapCursor = &cursor
+	monitorConfig.PollInterval = 10 * time.Millisecond
+	monitorConfig.UrgentWindow = 10 * time.Millisecond
+	monitorConfig.SeenEvictInterval = time.Hour
+	monitor := chatbridge.NewNotificationMonitor(
+		eventService,
+		nil,
+		nil,
+		svc,
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		monitorConfig,
+	)
+	stopMonitor := testutil.StartContextRunner(t, monitor)
+	defer stopMonitor()
+
+	require.Eventually(t, func() bool {
+		return smtpServer.data.Load() != nil
+	}, time.Second, 10*time.Millisecond)
+	assert.Equal(t, "dagu@example.com", smtpServer.mailFrom.Load())
+	assert.Equal(t, "ops@example.com", smtpServer.rcptTo.Load())
 }
 
 func TestService_SendTestReturnsProviderError(t *testing.T) {
