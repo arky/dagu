@@ -266,19 +266,25 @@ steps:
 		th := test.SetupCommand(t)
 		t.Setenv(runenv.EnvKeyQueueDispatchRetry, "1")
 
-		dagFile := th.DAG(t, `name: queue-dispatch-existing-attempt
+		dagFile := th.DAG(t, fmt.Sprintf(`name: queue-dispatch-existing-attempt
 steps:
   - name: "1"
-    run: echo queued dispatch
-`)
+    run: %s
+    dependencies: templates/**
+`, test.ForOS("cat templates/input.txt", "type templates/input.txt")))
+		templateDir := filepath.Join(dagFile.WorkingDir, "templates")
+		require.NoError(t, os.MkdirAll(templateDir, 0o750))
+		require.NoError(t, os.WriteFile(filepath.Join(templateDir, "input.txt"), []byte("queued dispatch"), 0o600))
 
 		runID := "queue-dispatch-run"
-		attempt, err := th.DAGRunRepository.CreateAttempt(th.Context, dagFile.DAG, time.Now(), runID, persis.DAGRunCreateAttemptOptions{})
+		queuedDAG := dagFile.Clone()
+		queuedDAG.Location = ""
+		attempt, err := th.DAGRunRepository.CreateAttempt(th.Context, queuedDAG, time.Now(), runID, persis.DAGRunCreateAttemptOptions{})
 		require.NoError(t, err)
 		logPath := filepath.Join(th.Config.Paths.LogDir, "queue-dispatch-test.log")
 		require.NoError(t, os.MkdirAll(filepath.Dir(logPath), 0o750))
 
-		status := ir.NewStatusBuilder(dagFile.DAG).Create(
+		status := ir.NewStatusBuilder(queuedDAG).Create(
 			runID,
 			ir.Queued,
 			0,
