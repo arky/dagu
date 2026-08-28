@@ -29,6 +29,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/eventstore"
 	"github.com/dagucloud/dagu/v2/internal/ir"
 	"github.com/dagucloud/dagu/v2/internal/persis"
+	profilepkg "github.com/dagucloud/dagu/v2/internal/profile"
 	"github.com/dagucloud/dagu/v2/internal/proto/convert"
 	"github.com/dagucloud/dagu/v2/internal/queue"
 	"github.com/dagucloud/dagu/v2/internal/runtime"
@@ -169,6 +170,7 @@ type Handler struct {
 	activeDistributedRunStore dispatch.ActiveDistributedRunStore // Shared active distributed attempt index
 	dagRepository             *persis.DAGRepository              // DAG definitions for the GetDAG RPC
 	secretStore               secretpkg.Store                    // Secret registry for workers
+	profileStore              profilepkg.Store                   // Runtime profiles for workers
 	agentSessionCleanupQueue  *agentsession.CleanupQueue         // Deferred provider cleanup owned by workers
 
 	// Open attempts cache for status persistence
@@ -240,6 +242,10 @@ type HandlerConfig struct {
 	// Optional - when nil, ResolveSecretReference returns FailedPrecondition.
 	SecretStore secretpkg.Store
 
+	// ProfileStore resolves runtime profiles for workers.
+	// Optional - when nil, ResolveRuntimeProfile returns FailedPrecondition.
+	ProfileStore profilepkg.Store
+
 	// AgentSessionCleanupQueue stores provider cleanup claimed by owning workers.
 	AgentSessionCleanupQueue *agentsession.CleanupQueue
 
@@ -301,6 +307,7 @@ func NewHandler(cfg HandlerConfig) *Handler {
 		activeDistributedRunStore: cfg.ActiveDistributedRunStore,
 		dagRepository:             cfg.DAGRepository,
 		secretStore:               cfg.SecretStore,
+		profileStore:              cfg.ProfileStore,
 		agentSessionCleanupQueue:  cfg.AgentSessionCleanupQueue,
 		staleHeartbeatThreshold:   cfg.StaleHeartbeatThreshold,
 		staleLeaseThreshold:       cfg.StaleLeaseThreshold,
@@ -911,6 +918,7 @@ func (h *Handler) writeInitialStatus(ctx context.Context, attempt dagrun.Attempt
 		TriggerActor: task.TriggerActor,
 		ScheduleTime: task.ScheduleTime,
 		DefinitionID: task.DefinitionId,
+		ProfileName:  task.ProfileName,
 	}
 	return attempt.Write(ctx, initialStatus)
 }
@@ -1783,10 +1791,11 @@ func (h *Handler) ReportStatus(ctx context.Context, req *coordinatorv1.ReportSta
 	if len(dagRunStatus.Labels) == 0 {
 		dagRunStatus.Labels = splitTaskLabels(req.Labels)
 	}
+	var activeLease *dispatch.DAGRunLease
 	leaseMissing := false
 	if h.dagRunLeaseStore != nil {
 		var validationErr error
-		leaseMissing, validationErr = h.validateStatusLease(ctx, req.WorkerId, dagRunStatus)
+		activeLease, leaseMissing, validationErr = h.validateStatusLease(ctx, req.WorkerId, dagRunStatus)
 		if validationErr != nil {
 			if status.Code(validationErr) == codes.FailedPrecondition {
 				return &coordinatorv1.ReportStatusResponse{Accepted: false, Error: status.Convert(validationErr).Message()}, nil
@@ -1807,6 +1816,16 @@ func (h *Handler) ReportStatus(ctx context.Context, req *coordinatorv1.ReportSta
 
 	latestAttempt, latestStatus, err := h.resolveLatestAttempt(ctx, dagRunStatus.Name, dagRunStatus.DAGRunID, dagRunStatus.Root)
 	if err != nil {
+		if errors.Is(err, dagrun.ErrDAGRunIDNotFound) {
+			profileErr := h.reconcileStatusProfile(ctx, activeLease, nil, dagRunStatus)
+			if errors.Is(profileErr, errProfileMismatch) {
+				logRejectedRemoteStatusUpdate(ctx, req.WorkerId, dagRunStatus, nil, remoteAttemptRejectedSuperseded)
+				return &coordinatorv1.ReportStatusResponse{Accepted: false, Error: remoteAttemptRejectedSuperseded}, nil
+			}
+			if profileErr != nil {
+				return nil, status.Error(codes.Internal, "failed to reconcile runtime profile: "+profileErr.Error())
+			}
+		}
 		bootstrappedAttempt, bootstrapped, bootstrapErr := h.bootstrapMissingSubAttempt(ctx, req.WorkerId, req.SourceFile, dagRunStatus, err)
 		if bootstrapErr != nil {
 			return nil, status.Error(codes.Internal, "failed to bootstrap sub-attempt: "+bootstrapErr.Error())
@@ -1846,6 +1865,14 @@ func (h *Handler) ReportStatus(ctx context.Context, req *coordinatorv1.ReportSta
 	if leaseMissing && latestStatus.Status != ir.NotStarted && !isTerminalRunStatus(latestStatus.Status) {
 		logRejectedRemoteStatusUpdate(ctx, req.WorkerId, dagRunStatus, latestStatus, remoteAttemptRejectedLeaseInactive)
 		return &coordinatorv1.ReportStatusResponse{Accepted: false, Error: remoteAttemptRejectedLeaseInactive}, nil
+	}
+	profileErr := h.reconcileStatusProfile(ctx, activeLease, latestStatus, dagRunStatus)
+	if errors.Is(profileErr, errProfileMismatch) {
+		logRejectedRemoteStatusUpdate(ctx, req.WorkerId, dagRunStatus, latestStatus, remoteAttemptRejectedSuperseded)
+		return &coordinatorv1.ReportStatusResponse{Accepted: false, Error: remoteAttemptRejectedSuperseded}, nil
+	}
+	if profileErr != nil {
+		return nil, status.Error(codes.Internal, "failed to reconcile runtime profile: "+profileErr.Error())
 	}
 	accepted, rejectReason := ownership.statusDecision(ctx, latestStatus, dagRunStatus, statusDecisionOptions{
 		CancellationRequested: h.sameAttemptCancellationRequested(ctx, latestAttempt, latestStatus, dagRunStatus),
