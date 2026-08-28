@@ -24,6 +24,7 @@ import (
 
 	"github.com/bmatcuk/doublestar/v4"
 
+	"github.com/dagucloud/dagu/v2/internal/cmn/dirlock"
 	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
 )
 
@@ -32,11 +33,13 @@ const (
 	DefaultMaxUncompressedSize int64 = 256 << 20
 	DefaultMaxFiles                  = 8192
 
-	archiveExt = ".tar.gz"
+	archiveExt                 = ".tar.gz"
+	storeLockHeartbeatInterval = 10 * time.Second
 )
 
 var (
 	errPathEscapesBundle = errors.New("path escapes workspace bundle")
+	errInvalidBundle     = errors.New("invalid workspace bundle")
 	zeroTime             = time.Unix(0, 0).UTC()
 )
 
@@ -626,8 +629,11 @@ func StoreDir(dataDir string) string {
 }
 
 type Store struct {
-	dir    string
-	limits Limits
+	dir                   string
+	limits                Limits
+	lock                  dirlock.DirLock
+	lockHeartbeatInterval time.Duration
+	gate                  chan struct{}
 }
 
 type Client interface {
@@ -640,9 +646,14 @@ func NewStore(dir string, limits Limits) *Store {
 	if dir != "" {
 		dir = filepath.Clean(dir)
 	}
+	gate := make(chan struct{}, 1)
+	gate <- struct{}{}
 	return &Store{
-		dir:    dir,
-		limits: normalizeLimits(limits),
+		dir:                   dir,
+		limits:                normalizeLimits(limits),
+		lock:                  dirlock.New(dir, nil),
+		lockHeartbeatInterval: storeLockHeartbeatInterval,
+		gate:                  gate,
 	}
 }
 
@@ -699,16 +710,29 @@ func (s *Store) PutReader(ctx context.Context, desc Descriptor, reader io.Reader
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("close workspace bundle: %w", err)
 	}
-	if _, err := os.Stat(path); err == nil {
+	return s.withLock(ctx, func(lockCtx context.Context) error {
+		if _, err := os.Stat(path); err == nil {
+			if fileMatchesDigest(lockCtx, path, desc.Digest, s.limits.MaxCompressedSize) {
+				if err := s.ensureLock(lockCtx); err != nil {
+					return err
+				}
+				if err := touch(path); err != nil {
+					return fmt.Errorf("refresh workspace bundle: %w", err)
+				}
+				return nil
+			}
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("stat workspace bundle: %w", err)
+		}
+		if err := s.ensureLock(lockCtx); err != nil {
+			return err
+		}
+		if err := fileutil.ReplaceFile(tmpName, path); err != nil {
+			return fmt.Errorf("commit workspace bundle: %w", err)
+		}
+		cleanup = false
 		return nil
-	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("stat workspace bundle: %w", err)
-	}
-	if err := fileutil.ReplaceFile(tmpName, path); err != nil {
-		return fmt.Errorf("commit workspace bundle: %w", err)
-	}
-	cleanup = false
-	return nil
+	})
 }
 
 func (s *Store) Get(ctx context.Context, digest string) ([]byte, error) {
@@ -733,6 +757,40 @@ func (s *Store) Open(ctx context.Context, digest string) (*os.File, int64, error
 	if err != nil {
 		return nil, 0, err
 	}
+	var file *os.File
+	var size int64
+	err = s.withLock(ctx, func(lockCtx context.Context) error {
+		file, size, err = openVerified(lockCtx, path, digest, s.limits.MaxCompressedSize)
+		if err != nil {
+			return err
+		}
+		if err := s.ensureLock(lockCtx); err != nil {
+			return err
+		}
+		if err := touch(path); err != nil {
+			return fmt.Errorf("refresh workspace bundle: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		if file != nil {
+			_ = file.Close()
+		}
+		return nil, 0, err
+	}
+	return file, size, nil
+}
+
+func (s *Store) Has(digest string) bool {
+	path, err := s.path(digest)
+	if err != nil {
+		return false
+	}
+	_, err = os.Stat(path)
+	return err == nil
+}
+
+func openVerified(ctx context.Context, path, digest string, maxSize int64) (*os.File, int64, error) {
 	file, err := os.Open(path) //nolint:gosec // path is derived from a validated digest and configured store directory.
 	if err != nil {
 		return nil, 0, fmt.Errorf("open workspace bundle: %w", err)
@@ -745,19 +803,16 @@ func (s *Store) Open(ctx context.Context, digest string) (*os.File, int64, error
 	}()
 
 	hasher := sha256.New()
-	size, err := io.Copy(hasher, io.LimitReader(file, s.limits.MaxCompressedSize+1))
+	size, err := io.Copy(hasher, io.LimitReader(&contextReader{ctx: ctx, reader: file}, maxSize+1))
 	if err != nil {
 		return nil, 0, fmt.Errorf("read workspace bundle: %w", err)
 	}
-	if size > s.limits.MaxCompressedSize {
-		return nil, 0, fmt.Errorf("workspace bundle exceeds compressed size limit %d", s.limits.MaxCompressedSize)
+	if size > maxSize {
+		return nil, 0, fmt.Errorf("workspace bundle exceeds compressed size limit %d: %w", maxSize, errInvalidBundle)
 	}
 	actual := hex.EncodeToString(hasher.Sum(nil))
 	if actual != digest {
-		return nil, 0, fmt.Errorf("workspace bundle digest mismatch: got %s, want %s", actual, digest)
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, 0, err
+		return nil, 0, fmt.Errorf("workspace bundle digest mismatch: got %s, want %s: %w", actual, digest, errInvalidBundle)
 	}
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return nil, 0, fmt.Errorf("rewind workspace bundle: %w", err)
@@ -766,13 +821,225 @@ func (s *Store) Open(ctx context.Context, digest string) (*os.File, int64, error
 	return file, size, nil
 }
 
-func (s *Store) Has(digest string) bool {
-	path, err := s.path(digest)
+func fileMatchesDigest(ctx context.Context, path, digest string, maxSize int64) bool {
+	file, _, err := openVerified(ctx, path, digest, maxSize)
 	if err != nil {
 		return false
 	}
-	_, err = os.Stat(path)
-	return err == nil
+	_ = file.Close()
+	return true
+}
+
+// Touch reports whether a bundle exists and refreshes its expiration time.
+func (s *Store) Touch(ctx context.Context, digest string) (bool, error) {
+	if strings.TrimSpace(s.dir) == "" {
+		return false, fmt.Errorf("workspace bundle store is not configured")
+	}
+	path, err := s.path(digest)
+	if err != nil {
+		return false, err
+	}
+	var exists bool
+	err = s.withLock(ctx, func(lockCtx context.Context) error {
+		file, _, err := openVerified(lockCtx, path, digest, s.limits.MaxCompressedSize)
+		if err != nil {
+			if cause := context.Cause(lockCtx); cause != nil {
+				return cause
+			}
+			if errors.Is(err, fs.ErrNotExist) || errors.Is(err, errInvalidBundle) {
+				return nil
+			}
+			return err
+		}
+		defer func() { _ = file.Close() }()
+		if err := s.ensureLock(lockCtx); err != nil {
+			return err
+		}
+		if err := touch(path); err != nil {
+			return fmt.Errorf("refresh workspace bundle: %w", err)
+		}
+		exists = true
+		return nil
+	})
+	return exists, err
+}
+
+// Cleanup removes unprotected canonical bundles unused since before.
+func (s *Store) Cleanup(ctx context.Context, before time.Time, protected map[string]struct{}) (int, error) {
+	return s.CleanupReferenced(ctx, before, func(context.Context) (map[string]struct{}, error) {
+		return protected, nil
+	})
+}
+
+// CleanupReferenced removes expired bundles while preventing reference
+// transitions. references must return every currently protected digest.
+func (s *Store) CleanupReferenced(
+	ctx context.Context,
+	before time.Time,
+	references func(context.Context) (map[string]struct{}, error),
+) (int, error) {
+	if strings.TrimSpace(s.dir) == "" {
+		return 0, fmt.Errorf("workspace bundle store is not configured")
+	}
+	var removed int
+	err := s.withLock(ctx, func(lockCtx context.Context) error {
+		protected, err := references(lockCtx)
+		if err != nil {
+			return fmt.Errorf("list protected workspace bundles: %w", err)
+		}
+
+		var cleanupErrs []error
+		walkErr := filepath.WalkDir(s.dir, func(bundlePath string, entry fs.DirEntry, err error) error {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			if err != nil {
+				if bundlePath == s.dir {
+					return err
+				}
+				cleanupErrs = append(cleanupErrs, fmt.Errorf("inspect workspace bundle entry %q: %w", bundlePath, err))
+				return nil
+			}
+			if cause := context.Cause(lockCtx); cause != nil {
+				return cause
+			}
+			if entry.IsDir() {
+				if bundlePath != s.dir && (entry.Name() == "staging" || dirlock.IsLockDirectoryName(entry.Name())) {
+					return fs.SkipDir
+				}
+				return nil
+			}
+			if !strings.HasSuffix(entry.Name(), archiveExt) {
+				return nil
+			}
+
+			digest := strings.TrimSuffix(entry.Name(), archiveExt)
+			canonicalPath, pathErr := s.path(digest)
+			if pathErr != nil || filepath.Clean(bundlePath) != canonicalPath {
+				return nil
+			}
+			if _, ok := protected[digest]; ok {
+				return nil
+			}
+			info, err := entry.Info()
+			if os.IsNotExist(err) {
+				return nil
+			}
+			if err != nil {
+				cleanupErrs = append(cleanupErrs, fmt.Errorf("inspect workspace bundle entry %q: %w", bundlePath, err))
+				return nil
+			}
+			if !info.Mode().IsRegular() || !info.ModTime().Before(before) {
+				return nil
+			}
+			if err := s.ensureLock(lockCtx); err != nil {
+				return err
+			}
+			if err := fileutil.Remove(bundlePath); err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("remove expired workspace bundle: %w", err)
+			}
+			removed++
+			return nil
+		})
+		if walkErr != nil {
+			cleanupErrs = append(cleanupErrs, walkErr)
+		}
+		return errors.Join(cleanupErrs...)
+	})
+	if err != nil {
+		return removed, fmt.Errorf("clean workspace bundles: %w", err)
+	}
+	return removed, nil
+}
+
+// WithLock runs fn while holding the shared bundle-store lock.
+func (s *Store) WithLock(ctx context.Context, fn func(context.Context) error) error {
+	return s.withLock(ctx, fn)
+}
+
+func (s *Store) withLock(ctx context.Context, fn func(context.Context) error) (retErr error) {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.gate:
+	}
+	defer func() { s.gate <- struct{}{} }()
+
+	if err := s.lock.Lock(ctx); err != nil {
+		return fmt.Errorf("lock workspace bundle store: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		if unlockErr := s.lock.Unlock(); unlockErr != nil {
+			return errors.Join(err, fmt.Errorf("unlock workspace bundle store: %w", unlockErr))
+		}
+		return err
+	}
+
+	lockCtx, cancel := context.WithCancelCause(ctx)
+	stopHeartbeat := make(chan struct{})
+	heartbeatDone := make(chan error, 1)
+	interval := s.lockHeartbeatInterval
+	if interval <= 0 {
+		interval = storeLockHeartbeatInterval
+	}
+	// Keep the shared lease live until the protected filesystem work ends.
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopHeartbeat:
+				heartbeatDone <- nil
+				return
+			case <-ticker.C:
+				if err := s.lock.Heartbeat(context.WithoutCancel(ctx)); err != nil {
+					err = fmt.Errorf("renew workspace bundle store lock: %w", err)
+					cancel(err)
+					heartbeatDone <- err
+					return
+				}
+			}
+		}
+	}()
+
+	defer func() {
+		close(stopHeartbeat)
+		if err := <-heartbeatDone; err != nil && !errors.Is(retErr, err) {
+			retErr = errors.Join(retErr, err)
+		}
+		cancel(nil)
+		if err := s.lock.Unlock(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("unlock workspace bundle store: %w", err))
+		}
+	}()
+	return fn(lockCtx)
+}
+
+func (s *Store) ensureLock(ctx context.Context) error {
+	if err := context.Cause(ctx); err != nil {
+		return err
+	}
+	if !s.lock.IsHeldByMe() {
+		return dirlock.ErrLockNotHeld
+	}
+	return nil
+}
+
+type contextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r *contextReader) Read(p []byte) (int, error) {
+	if err := context.Cause(r.ctx); err != nil {
+		return 0, err
+	}
+	return r.reader.Read(p)
+}
+
+func touch(path string) error {
+	now := time.Now()
+	return os.Chtimes(path, now, now)
 }
 
 func (s *Store) path(digest string) (string, error) {

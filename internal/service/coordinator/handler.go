@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/dagucloud/dagu/v2/internal/agentsession"
+	"github.com/dagucloud/dagu/v2/internal/cmn/dirlock"
 	"github.com/dagucloud/dagu/v2/internal/cmn/fileutil"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger"
 	"github.com/dagucloud/dagu/v2/internal/cmn/logger/tag"
@@ -65,6 +66,8 @@ const defaultStaleLeaseThreshold = dagrun.DefaultStaleLeaseThreshold
 const (
 	defaultDispatchPollInitialWait = 250 * time.Millisecond
 	defaultDispatchPollMaxWait     = time.Second
+	workspaceBundleTTL             = time.Hour
+	workspaceBundleCleanupInterval = time.Hour
 )
 
 // defaultLeaseRefreshWriteInterval is the maximum interval between persisted
@@ -466,6 +469,9 @@ func (h *Handler) Dispatch(ctx context.Context, req *coordinatorv1.DispatchReque
 	if req.Task.Definition == "" {
 		return nil, status.Error(codes.InvalidArgument, "task.Definition is required for distributed execution")
 	}
+	if err := h.ensureWorkspaceBundle(ctx, req.Task); err != nil {
+		return nil, err
+	}
 
 	logger.Info(ctx, "Handler Dispatch called",
 		tag.RunID(req.Task.DagRunId),
@@ -534,6 +540,42 @@ func (h *Handler) Dispatch(ctx context.Context, req *coordinatorv1.DispatchReque
 	}
 	h.notifyDispatchAvailable()
 	return &coordinatorv1.DispatchResponse{}, nil
+}
+
+func (h *Handler) ensureWorkspaceBundle(ctx context.Context, task *coordinatorv1.Task) error {
+	digest := task.WorkspaceBundleDigest
+	if digest == "" {
+		return nil
+	}
+	if !workspacebundle.ValidDigest(digest) {
+		return status.Error(codes.InvalidArgument, "invalid workspace bundle digest")
+	}
+	if h.workspaceBundleStore == nil {
+		return status.Error(codes.FailedPrecondition, "workspace bundle storage is not configured")
+	}
+	exists, err := h.workspaceBundleStore.Touch(ctx, digest)
+	if err != nil {
+		return status.Error(workspaceBundleTouchErrorCode(err), "failed to verify workspace bundle: "+err.Error())
+	}
+	if !exists {
+		return status.Error(codes.NotFound, "workspace bundle is missing or corrupt")
+	}
+	return nil
+}
+
+func workspaceBundleTouchErrorCode(err error) codes.Code {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return codes.Canceled
+	case errors.Is(err, context.DeadlineExceeded):
+		return codes.DeadlineExceeded
+	case errors.Is(err, dirlock.ErrLockConflict),
+		errors.Is(err, dirlock.ErrNotLocked),
+		errors.Is(err, dirlock.ErrLockNotHeld):
+		return codes.Unavailable
+	default:
+		return codes.Internal
+	}
 }
 
 func dispatchBindErrorCode(err error) codes.Code {
@@ -2498,9 +2540,12 @@ func (h *Handler) StartZombieDetector(ctx context.Context, interval time.Duratio
 			}
 		}
 		h.detectAndCleanupZombies(ctx)
+		h.cleanupWorkspaceBundles(ctx, time.Now().UTC())
 
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
+		bundleTicker := time.NewTicker(workspaceBundleCleanupInterval)
+		defer bundleTicker.Stop()
 
 		for {
 			select {
@@ -2508,6 +2553,8 @@ func (h *Handler) StartZombieDetector(ctx context.Context, interval time.Duratio
 				return
 			case <-ticker.C:
 				h.detectAndCleanupZombies(ctx)
+			case now := <-bundleTicker.C:
+				h.cleanupWorkspaceBundles(ctx, now.UTC())
 			}
 		}
 	}()
@@ -2540,6 +2587,53 @@ func (h *Handler) detectAndCleanupZombies(ctx context.Context) {
 	// stopped reporting owner-bound run heartbeats, including after coordinator
 	// restarts or owner coordinator loss.
 	h.detectStaleLeases(ctx)
+}
+
+func (h *Handler) cleanupWorkspaceBundles(ctx context.Context, now time.Time) {
+	if h.workspaceBundleStore == nil {
+		return
+	}
+	if _, err := h.workspaceBundleStore.CleanupReferenced(
+		ctx,
+		now.Add(-workspaceBundleTTL),
+		h.bundleDigests,
+	); err != nil {
+		logger.Warn(ctx, "Failed to clean expired workspace bundles", tag.Error(err))
+	}
+}
+
+func (h *Handler) bundleDigests(ctx context.Context) (map[string]struct{}, error) {
+	digests := make(map[string]struct{})
+	if h.dispatchTaskStore != nil {
+		taskDigests, err := h.dispatchTaskStore.ListBundleDigests(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("list dispatch bundle references: %w", err)
+		}
+		for _, digest := range taskDigests {
+			if !workspacebundle.ValidDigest(digest) {
+				return nil, fmt.Errorf("invalid dispatch bundle digest %q", digest)
+			}
+			digests[digest] = struct{}{}
+		}
+	}
+
+	if h.dagRunLeaseStore != nil {
+		leases, err := h.dagRunLeaseStore.ListAll(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("list lease bundle references: %w", err)
+		}
+		for _, lease := range leases {
+			digest := lease.WorkspaceBundleDigest
+			if digest == "" {
+				continue
+			}
+			if !workspacebundle.ValidDigest(digest) {
+				return nil, fmt.Errorf("invalid lease bundle digest %q", digest)
+			}
+			digests[digest] = struct{}{}
+		}
+	}
+	return digests, nil
 }
 
 // detectStaleLeases reconciles durable distributed-run leases and marks stale

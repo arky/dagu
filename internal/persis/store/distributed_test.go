@@ -73,6 +73,31 @@ func TestDAGRunLeaseStore_UpsertTouchListAndDelete(t *testing.T) {
 	assert.ErrorIs(t, err, dispatch.ErrDAGRunLeaseNotFound)
 }
 
+func TestDAGRunLeaseStore_PreservesBundleDigest(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	s := store.NewDAGRunLeaseStore(testutil.NewMemoryBackend().Collection("dag_run_leases"))
+	initial := dispatch.DAGRunLease{
+		AttemptKey:            "attempt-key",
+		WorkerID:              "worker-1",
+		WorkspaceBundleDigest: "bundle-a",
+	}
+	require.NoError(t, s.Upsert(ctx, initial))
+
+	heartbeat := initial
+	heartbeat.WorkspaceBundleDigest = ""
+	heartbeat.LastHeartbeatAt = time.Now().UTC().UnixMilli()
+	require.NoError(t, s.Upsert(ctx, heartbeat))
+	lease, err := s.Get(ctx, initial.AttemptKey)
+	require.NoError(t, err)
+	assert.Equal(t, initial.WorkspaceBundleDigest, lease.WorkspaceBundleDigest)
+
+	conflict := initial
+	conflict.WorkspaceBundleDigest = "bundle-b"
+	require.ErrorIs(t, s.Upsert(ctx, conflict), dispatch.ErrDAGRunLeaseConflict)
+}
+
 func TestDAGRunLeaseStore_ConcurrentTouchPreservesLatestHeartbeat(t *testing.T) {
 	t.Parallel()
 
@@ -666,6 +691,105 @@ func TestDispatchTaskStore_ReleaseClaimReturnsTaskToPending(t *testing.T) {
 	assert.Equal(t, "run-release", reclaimed.Task.DAGRunID)
 	assert.Equal(t, "coord-b", reclaimed.Task.Owner.ID)
 	assert.NotEqual(t, claimed.ClaimToken, reclaimed.ClaimToken)
+}
+
+func TestDispatchTaskStore_ListBundleDigests(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	s := store.NewDispatchTaskStore(testutil.NewMemoryBackend().Collection("dispatch_tasks"))
+	require.NoError(t, s.Enqueue(ctx, &dispatch.DispatchTask{
+		DAGRunID:              "run-pending",
+		Target:                "pending",
+		WorkerSelector:        map[string]string{"state": "pending"},
+		WorkspaceBundleDigest: "bundle-pending",
+	}))
+	require.NoError(t, s.Enqueue(ctx, &dispatch.DispatchTask{
+		DAGRunID:              "run-claimed",
+		Target:                "claimed",
+		WorkerSelector:        map[string]string{"state": "claimed"},
+		WorkspaceBundleDigest: "bundle-claimed",
+	}))
+	claimed, err := s.ClaimNext(ctx, dispatch.DispatchTaskClaim{
+		WorkerID: "worker-1",
+		Labels:   map[string]string{"state": "claimed"},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+
+	digests, err := s.ListBundleDigests(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"bundle-claimed", "bundle-pending"}, digests)
+
+	require.NoError(t, s.ReleaseClaim(ctx, claimed.ClaimToken))
+	digests, err = s.ListBundleDigests(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"bundle-claimed", "bundle-pending"}, digests)
+}
+
+func TestDispatchTaskStore_ListBundleDigestsDuringTransitions(t *testing.T) {
+	ctx := t.Context()
+	baseCol := testutil.NewMemoryBackend().Collection("dispatch_tasks")
+	var transitionMu sync.Mutex
+	transitionAttempted := make(chan struct{}, 1)
+	transitionLock := func(ctx context.Context, fn func(context.Context) error) error {
+		select {
+		case transitionAttempted <- struct{}{}:
+		default:
+		}
+		transitionMu.Lock()
+		defer transitionMu.Unlock()
+		return fn(ctx)
+	}
+	writer := store.NewDispatchTaskStore(baseCol, store.WithDispatchTransitionLock(transitionLock))
+	require.NoError(t, writer.Enqueue(ctx, &dispatch.DispatchTask{
+		DAGRunID:              "run-transitioning",
+		Target:                "task",
+		WorkspaceBundleDigest: "bundle-transitioning",
+	}))
+	claimed, err := writer.ClaimNext(ctx, dispatch.DispatchTaskClaim{WorkerID: "worker-1"})
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	select {
+	case <-transitionAttempted:
+	default:
+	}
+
+	var released atomic.Bool
+	releaseDone := make(chan error, 1)
+	col := &transitioningListCollection{
+		Collection: baseCol,
+		afterFirstPending: func() {
+			go func() {
+				releaseDone <- writer.ReleaseClaim(ctx, claimed.ClaimToken)
+			}()
+			select {
+			case err := <-releaseDone:
+				require.NoError(t, err)
+				released.Store(true)
+			case <-transitionAttempted:
+			}
+		},
+		afterClaims: func() {
+			if !released.Load() {
+				return
+			}
+			reclaimed, err := writer.ClaimNext(ctx, dispatch.DispatchTaskClaim{WorkerID: "worker-1"})
+			require.NoError(t, err)
+			require.NotNil(t, reclaimed)
+		},
+	}
+	reader := store.NewDispatchTaskStore(col)
+
+	var digests []string
+	transitionMu.Lock()
+	digests, err = reader.ListBundleDigests(ctx)
+	transitionMu.Unlock()
+	require.NoError(t, err)
+	assert.Equal(t, []string{"bundle-transitioning"}, digests)
+	if !released.Load() {
+		require.NoError(t, <-releaseDone)
+	}
 }
 
 func TestDispatchTaskStore_ReleaseClaimDeletesPendingWhenClaimDeleteConflicts(t *testing.T) {
@@ -1991,6 +2115,7 @@ func TestDistributedStores_ReadFileLayout(t *testing.T) {
 	gotLease, err := leaseStore.Get(ctx, leaseKey)
 	require.NoError(t, err)
 	assert.Equal(t, fileLease.AttemptKey, gotLease.AttemptKey)
+	assert.Empty(t, gotLease.WorkspaceBundleDigest)
 
 	fileActive := dispatch.ActiveDistributedRun{
 		AttemptKey: activeKey,
@@ -2434,4 +2559,28 @@ func (c *conflictingClaimDeleteCollection) CompareAndDelete(ctx context.Context,
 
 type opaqueCollection struct {
 	persis.Collection
+}
+
+type transitioningListCollection struct {
+	persis.Collection
+	afterFirstPending func()
+	afterClaims       func()
+	pendingLists      atomic.Int32
+}
+
+func (c *transitioningListCollection) List(ctx context.Context, q persis.ListQuery) (*persis.Page, error) {
+	page, err := c.Collection.List(ctx, q)
+	if err != nil || q.Cursor != "" {
+		return page, err
+	}
+
+	switch q.Prefix {
+	case "pending/":
+		if c.pendingLists.Add(1) == 1 {
+			c.afterFirstPending()
+		}
+	case "claims/":
+		c.afterClaims()
+	}
+	return page, nil
 }
