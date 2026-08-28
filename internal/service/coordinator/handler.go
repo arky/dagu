@@ -103,6 +103,45 @@ type runClaim struct {
 	lease      *dispatch.DAGRunLease
 }
 
+// runLockSet retains a per-run lock only while callers hold or wait for it.
+type runLockSet struct {
+	mu      sync.Mutex
+	entries map[string]*runLock
+}
+
+type runLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+func (s *runLockSet) lock(dagRunID string) *runLock {
+	s.mu.Lock()
+	if s.entries == nil {
+		s.entries = make(map[string]*runLock)
+	}
+	entry := s.entries[dagRunID]
+	if entry == nil {
+		entry = &runLock{}
+		s.entries[dagRunID] = entry
+	}
+	entry.refs++
+	s.mu.Unlock()
+
+	entry.mu.Lock()
+	return entry
+}
+
+func (s *runLockSet) unlock(dagRunID string, entry *runLock) {
+	entry.mu.Unlock()
+
+	s.mu.Lock()
+	entry.refs--
+	if entry.refs == 0 {
+		delete(s.entries, dagRunID)
+	}
+	s.mu.Unlock()
+}
+
 type Handler struct {
 	coordinatorv1.UnimplementedCoordinatorServiceServer
 
@@ -136,10 +175,8 @@ type Handler struct {
 	attemptsMu   sync.RWMutex
 	openAttempts map[string]dagrun.Attempt // dagRunID -> open attempt
 
-	// Per-run mutexes to prevent concurrent access to the same DAG run
-	// This prevents races between ReportStatus and markRunFailed
-	runMutexesMu sync.Mutex
-	runMutexes   map[string]*sync.Mutex // dagRunID -> per-run mutex
+	// Serializes status writes and repairs for each DAG run.
+	runLocks runLockSet
 
 	// Stale heartbeat threshold - configurable
 	staleHeartbeatThreshold time.Duration
@@ -251,7 +288,6 @@ func NewHandler(cfg HandlerConfig) *Handler {
 		dispatchPollInitialWait:   defaultDispatchPollInitialWait,
 		dispatchPollMaxWait:       defaultDispatchPollMaxWait,
 		openAttempts:              make(map[string]dagrun.Attempt),
-		runMutexes:                make(map[string]*sync.Mutex),
 		owner:                     cfg.Owner,
 		dagRunRepository:          cfg.DAGRunRepository,
 		logDir:                    cfg.LogDir,
@@ -361,22 +397,6 @@ func (h *Handler) Close(ctx context.Context) {
 		}
 		delete(h.openAttempts, dagRunID)
 	}
-}
-
-// getRunMutex returns a mutex for the given DAG run ID.
-// This ensures serialized access to operations on the same DAG run
-// across ReportStatus and zombie cleanup to prevent data races.
-func (h *Handler) getRunMutex(dagRunID string) *sync.Mutex {
-	h.runMutexesMu.Lock()
-	defer h.runMutexesMu.Unlock()
-
-	if mu, ok := h.runMutexes[dagRunID]; ok {
-		return mu
-	}
-
-	mu := &sync.Mutex{}
-	h.runMutexes[dagRunID] = mu
-	return mu
 }
 
 // Poll implements long polling - workers wait until a task is available
@@ -928,9 +948,8 @@ func (h *Handler) prepareAttemptForDispatch(ctx context.Context, task *coordinat
 		return nil, nil
 	}
 
-	runMu := h.getRunMutex(task.DagRunId)
-	runMu.Lock()
-	defer runMu.Unlock()
+	held := h.runLocks.lock(task.DagRunId)
+	defer h.runLocks.unlock(task.DagRunId, held)
 
 	isRootRun := task.ParentDagRunId == "" &&
 		(task.RootDagRunId == "" || task.RootDagRunId == task.DagRunId)
@@ -1019,7 +1038,10 @@ func (h *Handler) markPreparedAttemptDispatchFailed(ctx context.Context, task *c
 	if prepared == nil || prepared.attempt == nil {
 		return
 	}
-	defer h.releasePreparedDispatchAttempt(context.WithoutCancel(ctx), task.GetDagRunId(), prepared.attempt)
+	dagRunID := task.GetDagRunId()
+	held := h.runLocks.lock(dagRunID)
+	defer h.runLocks.unlock(dagRunID, held)
+	defer h.releasePreparedDispatchAttempt(context.WithoutCancel(ctx), dagRunID, prepared.attempt)
 
 	if !prepared.newlyCreated {
 		return
@@ -1540,7 +1562,10 @@ func (h *Handler) refreshLeaseForRunningTask(ctx context.Context, workerID strin
 		return
 	}
 
-	attempt, err := h.getOrOpenAttemptForRunningTask(ctx, task)
+	held := h.runLocks.lock(task.DagRunId)
+	defer h.runLocks.unlock(task.DagRunId, held)
+
+	attempt, err := h.openRunningAttemptLocked(ctx, task)
 	if err != nil {
 		logger.Warn(ctx, "Failed to resolve running task for lease refresh",
 			tag.RunID(task.DagRunId),
@@ -1549,10 +1574,6 @@ func (h *Handler) refreshLeaseForRunningTask(ctx context.Context, workerID strin
 		)
 		return
 	}
-
-	runMu := h.getRunMutex(task.DagRunId)
-	runMu.Lock()
-	defer runMu.Unlock()
 
 	runStatus, err := attempt.ReadStatus(ctx)
 	if err != nil {
@@ -1587,7 +1608,7 @@ func (h *Handler) refreshLeaseForRunningTask(ctx context.Context, workerID strin
 	}
 }
 
-func (h *Handler) getOrOpenAttemptForRunningTask(ctx context.Context, task *coordinatorv1.RunningTask) (dagrun.Attempt, error) {
+func (h *Handler) openRunningAttemptLocked(ctx context.Context, task *coordinatorv1.RunningTask) (dagrun.Attempt, error) {
 	if task == nil {
 		return nil, fmt.Errorf("running task is nil")
 	}
@@ -1597,13 +1618,13 @@ func (h *Handler) getOrOpenAttemptForRunningTask(ctx context.Context, task *coor
 		if task.RootDagRunName == "" {
 			return nil, fmt.Errorf("missing root dag run name for sub-dag %s", task.DagRunId)
 		}
-		return h.getOrOpenSubAttempt(ctx, ir.DAGRunRef{
+		return h.getOrOpenSubLocked(ctx, ir.DAGRunRef{
 			Name: task.RootDagRunName,
 			ID:   task.RootDagRunId,
 		}, task.DagRunId)
 	}
 
-	return h.getOrOpenAttempt(ctx, task.DagName, task.DagRunId)
+	return h.getOrOpenRootLocked(ctx, task.DagName, task.DagRunId)
 }
 
 func (h *Handler) shouldThrottleLeaseRefresh(status *ir.DAGRunStatus, observedAt time.Time) bool {
@@ -1781,9 +1802,8 @@ func (h *Handler) ReportStatus(ctx context.Context, req *coordinatorv1.ReportSta
 	}
 
 	// Acquire per-run mutex to serialize with markRunFailed
-	runMu := h.getRunMutex(dagRunStatus.DAGRunID)
-	runMu.Lock()
-	defer runMu.Unlock()
+	held := h.runLocks.lock(dagRunStatus.DAGRunID)
+	defer h.runLocks.unlock(dagRunStatus.DAGRunID, held)
 
 	latestAttempt, latestStatus, err := h.resolveLatestAttempt(ctx, dagRunStatus.Name, dagRunStatus.DAGRunID, dagRunStatus.Root)
 	if err != nil {
@@ -1797,6 +1817,7 @@ func (h *Handler) ReportStatus(ctx context.Context, req *coordinatorv1.ReportSta
 				return nil, status.Error(codes.Internal, "failed to resolve artifact path: "+err.Error())
 			}
 			if err := bootstrappedAttempt.Write(ctx, *dagRunStatus); err != nil {
+				h.closeCachedAttemptForRun(ctx, context.WithoutCancel(ctx), dagRunStatus.DAGRunID, bootstrappedAttempt.ID())
 				return nil, status.Error(codes.Internal, "failed to write status: "+err.Error())
 			}
 
@@ -1807,7 +1828,7 @@ func (h *Handler) ReportStatus(ctx context.Context, req *coordinatorv1.ReportSta
 			// reporting worker disconnects.
 			ownership.syncFromStatus(context.WithoutCancel(ctx), req.WorkerId, dagRunStatus, bootstrappedAttempt.ID())
 			h.finalizeAdmissionForStatus(ctx, dagRunStatus, bootstrappedAttempt.ID())
-			h.closeCachedWaitingAttempt(ctx, dagRunStatus, bootstrappedAttempt)
+			h.closeCachedInactiveAttempt(ctx, dagRunStatus, bootstrappedAttempt)
 
 			return &coordinatorv1.ReportStatusResponse{Accepted: true}, nil
 		}
@@ -1884,6 +1905,7 @@ func (h *Handler) ReportStatus(ctx context.Context, req *coordinatorv1.ReportSta
 			return nil, status.Error(codes.Internal, "failed to get/open latest attempt: "+err.Error())
 		}
 		if err := attempt.Write(ctx, *dagRunStatus); err != nil {
+			h.closeCachedAttemptForRun(ctx, context.WithoutCancel(ctx), dagRunStatus.DAGRunID, attempt.ID())
 			return nil, status.Error(codes.Internal, "failed to write status: "+err.Error())
 		}
 	}
@@ -1895,11 +1917,8 @@ func (h *Handler) ReportStatus(ctx context.Context, req *coordinatorv1.ReportSta
 	// worker disconnects.
 	ownership.syncFromStatus(context.WithoutCancel(ctx), req.WorkerId, dagRunStatus, attempt.ID())
 	h.finalizeAdmissionForStatus(ctx, dagRunStatus, attempt.ID())
-	h.closeCachedWaitingAttempt(ctx, dagRunStatus, attempt)
+	h.closeCachedInactiveAttempt(ctx, dagRunStatus, attempt)
 
-	// Note: We don't close the attempt immediately on terminal status because
-	// the agent may push the same terminal status multiple times from different
-	// code paths. Attempts are cleaned up during coordinator shutdown.
 	return &coordinatorv1.ReportStatusResponse{Accepted: true}, nil
 }
 
@@ -1972,12 +1991,15 @@ func equalOptionalString(left, right *string) bool {
 	return *left == *right
 }
 
-func (h *Handler) closeCachedWaitingAttempt(
+func (h *Handler) closeCachedInactiveAttempt(
 	ctx context.Context,
 	status *ir.DAGRunStatus,
 	attempt dagrun.Attempt,
 ) {
-	if status == nil || attempt == nil || status.Status != ir.Waiting {
+	if status == nil || attempt == nil {
+		return
+	}
+	if status.Status != ir.Waiting && !isTerminalRunStatus(status.Status) {
 		return
 	}
 	h.closeCachedAttemptForRun(ctx, context.WithoutCancel(ctx), status.DAGRunID, attempt.ID())
@@ -2274,11 +2296,9 @@ func (h *Handler) persistChatMessages(ctx context.Context, attempt dagrun.Attemp
 	persistNode(status.OnWait, "on_wait")
 }
 
-// getOrOpenAttempt retrieves an open attempt from cache or opens a new one.
-// Uses double-check locking to avoid holding the mutex during blocking I/O.
-func (h *Handler) getOrOpenAttempt(ctx context.Context, dagName, dagRunID string) (dagrun.Attempt, error) {
+func (h *Handler) getOrOpenRootLocked(ctx context.Context, dagName, dagRunID string) (dagrun.Attempt, error) {
 	ref := ir.DAGRunRef{Name: dagName, ID: dagRunID}
-	return h.getOrOpenAttemptWithFinder(ctx, dagRunID, func() (dagrun.Attempt, error) {
+	return h.getOrOpenLocked(ctx, dagRunID, func() (dagrun.Attempt, error) {
 		return h.dagRunRepository.FindAttempt(ctx, ref)
 	})
 }
@@ -2360,17 +2380,20 @@ func (h *Handler) replaceOpenAttempt(
 // getOrOpenSubAttempt retrieves an open sub-attempt from cache or opens a new one.
 // This is used for sub-DAG status reporting in distributed execution.
 func (h *Handler) getOrOpenSubAttempt(ctx context.Context, rootRef ir.DAGRunRef, subDAGRunID string) (dagrun.Attempt, error) {
-	return h.getOrOpenAttemptWithFinder(ctx, subDAGRunID, func() (dagrun.Attempt, error) {
+	held := h.runLocks.lock(subDAGRunID)
+	defer h.runLocks.unlock(subDAGRunID, held)
+
+	return h.getOrOpenSubLocked(ctx, rootRef, subDAGRunID)
+}
+
+func (h *Handler) getOrOpenSubLocked(ctx context.Context, rootRef ir.DAGRunRef, subDAGRunID string) (dagrun.Attempt, error) {
+	return h.getOrOpenLocked(ctx, subDAGRunID, func() (dagrun.Attempt, error) {
 		return h.dagRunRepository.FindSubAttempt(ctx, rootRef, subDAGRunID)
 	})
 }
 
-// getOrOpenAttemptWithFinder is a generic helper that retrieves an open attempt from cache
-// or uses the provided finder function to locate and open a new one.
-// Uses per-run mutex to prevent concurrent I/O operations on the same DAG run,
-// avoiding races between ReportStatus and markRunFailed.
-func (h *Handler) getOrOpenAttemptWithFinder(ctx context.Context, cacheKey string, finder func() (dagrun.Attempt, error)) (dagrun.Attempt, error) {
-	// First check: fast path with read lock (no per-run mutex needed for cache hit)
+// getOrOpenLocked retrieves or opens an attempt while its run lock is held.
+func (h *Handler) getOrOpenLocked(ctx context.Context, cacheKey string, finder func() (dagrun.Attempt, error)) (dagrun.Attempt, error) {
 	h.attemptsMu.RLock()
 	if attempt, ok := h.openAttempts[cacheKey]; ok {
 		h.attemptsMu.RUnlock()
@@ -2378,20 +2401,6 @@ func (h *Handler) getOrOpenAttemptWithFinder(ctx context.Context, cacheKey strin
 	}
 	h.attemptsMu.RUnlock()
 
-	// Acquire per-run mutex to serialize I/O operations for this DAG run
-	runMu := h.getRunMutex(cacheKey)
-	runMu.Lock()
-	defer runMu.Unlock()
-
-	// Re-check cache after acquiring per-run mutex (another goroutine may have opened it)
-	h.attemptsMu.RLock()
-	if attempt, ok := h.openAttempts[cacheKey]; ok {
-		h.attemptsMu.RUnlock()
-		return attempt, nil
-	}
-	h.attemptsMu.RUnlock()
-
-	// Perform I/O with per-run mutex held
 	attempt, err := finder()
 	if err != nil {
 		return nil, err
@@ -2401,18 +2410,8 @@ func (h *Handler) getOrOpenAttemptWithFinder(ctx context.Context, cacheKey strin
 		return nil, err
 	}
 
-	// Add to cache under write lock
 	h.attemptsMu.Lock()
 	defer h.attemptsMu.Unlock()
-
-	// Final check: if somehow another goroutine got through, use theirs
-	if existing, ok := h.openAttempts[cacheKey]; ok {
-		if err := attempt.Close(ctx); err != nil {
-			logger.Warn(ctx, "Failed to close duplicate opened attempt", tag.Error(err))
-		}
-		return existing, nil
-	}
-
 	h.openAttempts[cacheKey] = attempt
 	return attempt, nil
 }
@@ -2812,9 +2811,8 @@ func (h *Handler) repairStaleRun(
 ) (*ir.DAGRunStatus, bool, error) {
 	repairCtx := context.WithoutCancel(ctx)
 	if status != nil && status.DAGRunID != "" {
-		runMu := h.getRunMutex(status.DAGRunID)
-		runMu.Lock()
-		defer runMu.Unlock()
+		held := h.runLocks.lock(status.DAGRunID)
+		defer h.runLocks.unlock(status.DAGRunID, held)
 
 		attemptID := status.AttemptID
 		if attemptID == "" {
@@ -3102,9 +3100,8 @@ func (h *Handler) failCurrentRemoteAttempt(
 	expectedStatuses ...ir.Status,
 ) {
 	storeCtx := context.WithoutCancel(ctx)
-	runMu := h.getRunMutex(dagRun.ID)
-	runMu.Lock()
-	defer runMu.Unlock()
+	held := h.runLocks.lock(dagRun.ID)
+	defer h.runLocks.unlock(dagRun.ID, held)
 
 	if attemptID == "" {
 		logger.Error(ctx, "Skipping distributed stale-run repair due to missing attempt ID",
@@ -3236,9 +3233,8 @@ func (h *Handler) markRunFailed(ctx context.Context, dagName, dagRunID, reason s
 	}
 	storeCtx := context.WithoutCancel(ctx)
 
-	runMu := h.getRunMutex(dagRunID)
-	runMu.Lock()
-	defer runMu.Unlock()
+	held := h.runLocks.lock(dagRunID)
+	defer h.runLocks.unlock(dagRunID, held)
 
 	var attempt dagrun.Attempt
 	var needsOpen bool
@@ -3260,6 +3256,9 @@ func (h *Handler) markRunFailed(ctx context.Context, dagName, dagRunID, reason s
 		}
 		attempt = foundAttempt
 		needsOpen = true
+	}
+	if !needsOpen {
+		defer h.closeCachedAttemptForRun(ctx, storeCtx, dagRunID, attempt.ID())
 	}
 
 	dagRunStatus, err := attempt.ReadStatus(storeCtx)
