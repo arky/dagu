@@ -380,6 +380,8 @@ steps:
     run: apt-get update -q && apt-get upgrade -y
 ```
 
+See the [Sub-DAGs](https://docs.dagu.sh/writing-workflows/sub-dags) documentation for parameter passing and fan-out options.
+
 ### SSH remote execution
 
 ```yaml
@@ -400,6 +402,8 @@ steps:
     depends: health
 ```
 
+See the [SSH](https://docs.dagu.sh/step-types/ssh) documentation for authentication and connection options.
+
 ### Scheduling with overlap control and catch-up
 
 ```yaml
@@ -416,6 +420,8 @@ handler_on:
     run: cleanup.sh
 ```
 
+See the [Scheduling](https://docs.dagu.sh/writing-workflows/scheduling) and [Lifecycle Handlers](https://docs.dagu.sh/writing-workflows/lifecycle-handlers) documentation for all options.
+
 ### Retry and error handling
 
 ```yaml
@@ -429,7 +435,7 @@ steps:
       failure: true
 ```
 
-See the [Sub-DAG](https://docs.dagu.sh/writing-workflows/sub-dags), [SSH](https://docs.dagu.sh/step-types/ssh), [scheduling](https://docs.dagu.sh/writing-workflows/scheduling), and [notification](https://docs.dagu.sh/web-ui/notifications) documentation for complete configuration details.
+See the [Durable Execution](https://docs.dagu.sh/writing-workflows/durable-execution) and [Continue On](https://docs.dagu.sh/writing-workflows/continue-on) documentation for retry policies and failure handling.
 
 ## More Workflow Examples
 
@@ -465,6 +471,8 @@ graph LR
     style C fill:#18181B,stroke:#22C55E,stroke-width:1.6px,color:#fff
     style D fill:#18181B,stroke:#3B82F6,stroke-width:1.6px,color:#fff
 ```
+
+See the [Control Flow](https://docs.dagu.sh/writing-workflows/control-flow) documentation for dependencies, conditions, and repetition.
 
 ### Reuse unchanged results
 
@@ -553,6 +561,8 @@ steps:
           memory: "4Gi"
       command: ./process.sh
 ```
+
+See the [Kubernetes](https://docs.dagu.sh/step-types/kubernetes) documentation for Job configuration options.
 
 For more examples, see the [Examples documentation](https://docs.dagu.sh/writing-workflows/examples).
 
