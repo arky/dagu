@@ -323,13 +323,29 @@ steps:
 
 ### Docker step
 
+Pass standard `docker run` options directly in YAML, including the image, pull policy, platform, volume mounts, working directory, and resource limits:
+
 ```yaml
+resources:
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
 steps:
-  - name: build
-    container:
-      image: node:20-alpine
-    run: npm run build
+  - id: report
+    action: docker.run
+    with:
+      image: ghcr.io/acme/reporting:1.4.2
+      pull: always
+      platform: linux/amd64
+      working_dir: /work
+      volumes:
+        - ~/orders:/work/data
+      auto_remove: true
+      command: python generate_report.py --input /work/data/orders.csv
 ```
+
+See the [Docker](https://docs.dagu.sh/step-types/docker) and [DAG Run Resource Limits](https://docs.dagu.sh/writing-workflows/dag-run-resource-limits) documentation for all configuration options.
 
 ### Parallel Sub-DAG execution
 
