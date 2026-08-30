@@ -358,6 +358,93 @@ steps:
 	})
 }
 
+func TestSubDAG_SharedNothingNestedNamedFileDependencies(t *testing.T) {
+	const (
+		stageDependency = "stage-input.txt"
+		stageContent    = "dependency for stage worker"
+		leafDependency  = "leaf-input.txt"
+		leafContent     = "dependency for leaf worker"
+	)
+
+	f := newTestFixture(t, `
+name: shared-nothing-root
+worker_selector:
+  layer: root
+steps:
+  - id: call_stage
+    action: dag.run
+    with:
+      dag: shared-nothing-stage
+`, withWorkerCount(0), withLogPersistence())
+	defer f.cleanup()
+
+	f.coord.CreateDAGFile(t, f.coord.Config.Paths.DAGsDir, "shared-nothing-stage", []byte(`
+name: shared-nothing-stage
+worker_selector:
+  layer: stage
+steps:
+  - id: read_stage_dependency
+    dependencies:
+      - `+stageDependency+`
+    action: file.read
+    with:
+      path: `+stageDependency+`
+    output: CONTENT
+  - id: call_leaf
+    depends: [read_stage_dependency]
+    action: dag.run
+    with:
+      dag: shared-nothing-leaf
+`))
+	f.coord.CreateDAGFile(t, f.coord.Config.Paths.DAGsDir, "shared-nothing-leaf", []byte(`
+name: shared-nothing-leaf
+worker_selector:
+  layer: leaf
+steps:
+  - id: read_leaf_dependency
+    dependencies:
+      - `+leafDependency+`
+    action: file.read
+    with:
+      path: `+leafDependency+`
+    output: CONTENT
+`))
+	require.NoError(t, os.WriteFile(filepath.Join(f.coord.Config.Paths.DAGsDir, stageDependency), []byte(stageContent), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(f.coord.Config.Paths.DAGsDir, leafDependency), []byte(leafContent), 0o600))
+
+	f.workers = append(f.workers,
+		f.setupWorkerMode("root-worker", map[string]string{"layer": "root"}, "", true, nil),
+		f.setupWorkerMode("stage-worker", map[string]string{"layer": "stage"}, "", true, nil),
+		f.setupWorkerMode("leaf-worker", map[string]string{"layer": "leaf"}, "", true, nil),
+	)
+
+	require.NoError(t, f.enqueue())
+	f.waitForQueued()
+	f.startScheduler(30 * time.Second)
+
+	rootStatus := f.waitForStatus(ir.Succeeded, executionStatusTimeout())
+	require.Equal(t, "root-worker", rootStatus.WorkerID)
+	rootCall := requireNodeByID(t, rootStatus, "call_stage")
+	require.Len(t, rootCall.SubRuns, 1)
+
+	rootRef := ir.NewDAGRunRef(rootStatus.Name, rootStatus.DAGRunID)
+	stageStatus := readDistributedSubAttemptStatus(t, f, rootRef, rootCall.SubRuns[0].DAGRunID)
+	require.Equal(t, ir.Succeeded, stageStatus.Status)
+	require.Equal(t, "stage-worker", stageStatus.WorkerID)
+	require.Equal(t, rootRef, stageStatus.Root)
+	require.Equal(t, rootRef, stageStatus.Parent)
+	require.Equal(t, stageContent, nodeOutputValue(t, requireNodeByID(t, *stageStatus, "read_stage_dependency"), "CONTENT"))
+
+	stageCall := requireNodeByID(t, *stageStatus, "call_leaf")
+	require.Len(t, stageCall.SubRuns, 1)
+	leafStatus := readDistributedSubAttemptStatus(t, f, rootRef, stageCall.SubRuns[0].DAGRunID)
+	require.Equal(t, ir.Succeeded, leafStatus.Status)
+	require.Equal(t, "leaf-worker", leafStatus.WorkerID)
+	require.Equal(t, rootRef, leafStatus.Root)
+	require.Equal(t, ir.NewDAGRunRef(stageStatus.Name, stageStatus.DAGRunID), leafStatus.Parent)
+	require.Equal(t, leafContent, nodeOutputValue(t, requireNodeByID(t, *leafStatus, "read_leaf_dependency"), "CONTENT"))
+}
+
 func TestSubDAG_InSameFile(t *testing.T) {
 	t.Run("parentAndChildInSameYAMLFile", func(t *testing.T) {
 		f := newTestFixture(t, `

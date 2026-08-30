@@ -6,6 +6,7 @@ package coordinator
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -25,6 +26,7 @@ import (
 	"github.com/dagucloud/dagu/v2/internal/persis"
 	persistestutil "github.com/dagucloud/dagu/v2/internal/persis/testutil"
 	"github.com/dagucloud/dagu/v2/internal/proto/convert"
+	"github.com/dagucloud/dagu/v2/internal/runtime/workspacebundle"
 	coordinatorv1 "github.com/dagucloud/dagu/v2/proto/coordinator/v1"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1187,6 +1189,170 @@ func TestHandler_DispatchRejectsStaleQueueDispatchRetry(t *testing.T) {
 	require.NoError(t, readErr)
 	require.Equal(t, "attempt-current", runStatus.AttemptID)
 	require.Equal(t, ir.Aborted, runStatus.Status)
+}
+
+func TestHandlerDispatchPreparesAuthoritativeDAGWorkspace(t *testing.T) {
+	registerCommandExecutorCapsForCoordinatorTest()
+
+	ctx := context.Background()
+	dagDir := t.TempDir()
+	definition := []byte("name: remote-child\nsteps:\n  - name: consume\n    run: cat input.txt\n    dependencies: input.txt\n")
+	require.NoError(t, os.WriteFile(filepath.Join(dagDir, "remote-child.yaml"), definition, 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(dagDir, "input.txt"), []byte("coordinator-owned"), 0o600))
+
+	distributedDir := filepath.Join(t.TempDir(), "distributed")
+	dispatchStore := newTestDispatchTaskStore(distributedDir)
+	heartbeatStore := newTestWorkerHeartbeatStore(distributedDir)
+	require.NoError(t, heartbeatStore.Upsert(ctx, dispatch.WorkerHeartbeatRecord{
+		WorkerID:        "worker-1",
+		LastHeartbeatAt: time.Now().UTC().UnixMilli(),
+	}))
+	dagRunStore := newMockDAGRunStore()
+	bundleDir := filepath.Join(t.TempDir(), "workspace-bundles")
+	h := NewHandler(HandlerConfig{
+		DAGRunRepository:     dagRunStore.repository,
+		DAGRepository:        testutil.NewFileDAGRepository(dagDir),
+		DispatchTaskStore:    dispatchStore,
+		WorkerHeartbeatStore: heartbeatStore,
+		WorkspaceBundleDir:   bundleDir,
+	})
+	t.Cleanup(func() { h.Close(context.Background()) })
+
+	_, err := h.Dispatch(ctx, &coordinatorv1.DispatchRequest{Task: &coordinatorv1.Task{
+		Operation:      coordinatorv1.Operation_OPERATION_START,
+		RootDagRunName: "remote-child",
+		RootDagRunId:   "run-remote-child",
+		DagRunId:       "run-remote-child",
+		Target:         "remote-child",
+		Definition:     string(definition),
+		QueueName:      "default",
+	}})
+	require.NoError(t, err)
+
+	claimed, err := dispatchStore.ClaimNext(ctx, dispatch.DispatchTaskClaim{
+		WorkerID:     "worker-1",
+		PollerID:     "poller-1",
+		ClaimTimeout: time.Minute,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, claimed)
+	require.NotNil(t, claimed.Task)
+	require.NotEmpty(t, claimed.Task.WorkspaceBundleDigest)
+	assert.Empty(t, claimed.Task.SourceFile)
+
+	archive, err := h.workspaceBundleStore.Get(ctx, claimed.Task.WorkspaceBundleDigest)
+	require.NoError(t, err)
+	desc := workspacebundle.Descriptor{
+		Digest:      claimed.Task.WorkspaceBundleDigest,
+		Size:        claimed.Task.WorkspaceBundleSize,
+		DAGPath:     claimed.Task.WorkspaceBundleDAGPath,
+		OriginalRef: claimed.Task.WorkspaceBundleOriginalRef,
+		ResolvedRef: claimed.Task.WorkspaceBundleResolvedRef,
+	}
+	dest := filepath.Join(t.TempDir(), "workspace")
+	require.NoError(t, workspacebundle.Extract(archive, dest, desc, workspacebundle.DefaultLimits()))
+	assert.FileExists(t, filepath.Join(dest, "input.txt"))
+	actualDAG, err := os.ReadFile(filepath.Join(dest, filepath.FromSlash(desc.DAGPath)))
+	require.NoError(t, err)
+	assert.Equal(t, definition, actualDAG)
+	entries, err := os.ReadDir(filepath.Join(bundleDir, "staging"))
+	require.NoError(t, err)
+	assert.Empty(t, entries)
+}
+
+func TestHandlerDispatchRejectsChangedNamedDAGBeforeAttemptCreation(t *testing.T) {
+	registerCommandExecutorCapsForCoordinatorTest()
+
+	ctx := context.Background()
+	dagDir := t.TempDir()
+	authoritative := []byte("name: remote-child\nsteps:\n  - name: consume\n    run: cat input.txt\n    dependencies: input.txt\n")
+	stale := []byte("name: remote-child\nsteps:\n  - name: consume\n    run: cat stale.txt\n    dependencies: stale.txt\n")
+	require.NoError(t, os.WriteFile(filepath.Join(dagDir, "remote-child.yaml"), authoritative, 0o600))
+
+	distributedDir := filepath.Join(t.TempDir(), "distributed")
+	dispatchStore := newTestDispatchTaskStore(distributedDir)
+	heartbeatStore := newTestWorkerHeartbeatStore(distributedDir)
+	require.NoError(t, heartbeatStore.Upsert(ctx, dispatch.WorkerHeartbeatRecord{
+		WorkerID:        "worker-1",
+		LastHeartbeatAt: time.Now().UTC().UnixMilli(),
+	}))
+	dagRunStore := newMockDAGRunStore()
+	h := NewHandler(HandlerConfig{
+		DAGRunRepository:     dagRunStore.repository,
+		DAGRepository:        testutil.NewFileDAGRepository(dagDir),
+		DispatchTaskStore:    dispatchStore,
+		WorkerHeartbeatStore: heartbeatStore,
+		WorkspaceBundleDir:   filepath.Join(t.TempDir(), "workspace-bundles"),
+	})
+
+	_, err := h.Dispatch(ctx, &coordinatorv1.DispatchRequest{Task: &coordinatorv1.Task{
+		DagRunId:   "run-stale-child",
+		Target:     "remote-child",
+		Definition: string(stale),
+		QueueName:  "default",
+	}})
+	require.Error(t, err)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.ErrorContains(t, err, "changed after remote resolution")
+	assert.Empty(t, dagRunStore.attempts)
+	count, countErr := dispatchStore.CountOutstandingByQueue(ctx, "default", time.Minute)
+	require.NoError(t, countErr)
+	assert.Zero(t, count)
+}
+
+func TestPrepareDispatchTaskWorkspaceUsesRuntimeParams(t *testing.T) {
+	registerCommandExecutorCapsForCoordinatorTest()
+
+	for _, tc := range []struct {
+		name      string
+		configure func(*testing.T, *coordinatorv1.Task, string)
+	}{
+		{
+			name: "ExplicitParams",
+			configure: func(_ *testing.T, task *coordinatorv1.Task, workDir string) {
+				task.Params = "WORKSPACE=" + workDir
+			},
+		},
+		{
+			name: "RetryPreviousStatusParams",
+			configure: func(t *testing.T, task *coordinatorv1.Task, workDir string) {
+				task.Operation = coordinatorv1.Operation_OPERATION_RETRY
+				previousStatus, err := convert.DAGRunStatusToProto(&ir.DAGRunStatus{ParamsList: []string{"WORKSPACE=" + workDir}})
+				require.NoError(t, err)
+				task.PreviousStatus = previousStatus
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			dagDir := t.TempDir()
+			workDir := t.TempDir()
+			definition := []byte(fmt.Sprintf("name: remote-child\nparams:\n  WORKSPACE: %q\nworking_dir: ${params.WORKSPACE}\nsteps:\n  - name: consume\n    run: cat input.txt\n    dependencies: input.txt\n", dagDir))
+			require.NoError(t, os.WriteFile(filepath.Join(dagDir, "remote-child.yaml"), definition, 0o600))
+			require.NoError(t, os.WriteFile(filepath.Join(workDir, "input.txt"), []byte(tc.name), 0o600))
+
+			h := NewHandler(HandlerConfig{
+				DAGRepository:      testutil.NewFileDAGRepository(dagDir),
+				WorkspaceBundleDir: filepath.Join(t.TempDir(), "workspace-bundles"),
+			})
+			task := &coordinatorv1.Task{Target: "remote-child", Definition: string(definition)}
+			tc.configure(t, task, workDir)
+
+			require.NoError(t, h.prepareDispatchTaskWorkspace(ctx, task))
+			require.NotEmpty(t, task.WorkspaceBundleDigest)
+			archive, err := h.workspaceBundleStore.Get(ctx, task.WorkspaceBundleDigest)
+			require.NoError(t, err)
+			dest := filepath.Join(t.TempDir(), "workspace")
+			require.NoError(t, workspacebundle.Extract(archive, dest, workspacebundle.Descriptor{
+				Digest:  task.WorkspaceBundleDigest,
+				Size:    task.WorkspaceBundleSize,
+				DAGPath: task.WorkspaceBundleDagPath,
+			}, workspacebundle.DefaultLimits()))
+			actual, err := os.ReadFile(filepath.Join(dest, "input.txt"))
+			require.NoError(t, err)
+			assert.Equal(t, tc.name, string(actual))
+		})
+	}
 }
 
 type failingDispatchTaskStore struct {
