@@ -111,6 +111,7 @@ Distributed mode: Scheduler → Queue → dispatch policy → Coordinator (gRPC)
 - DAGs compose hierarchically — steps invoke other DAGs via the `dag` executor; `action:` is shorthand normalized at spec-build time.
 - Configuration uses `DAGU_*` environment variables, with fallback to `~/.config/dagu/config.yaml`.
 - Run `make fmt` before committing (lint also runs under `GOOS=windows` — keep Windows builds green).
+- Keep Go test function names short (e.g. `TestRouteExactMatch`, not `TestRouteExactMatchRunsOnlyMatchingTarget`); put the full explanation of what the test proves in a doc comment above the function, not in the name. Applies to `conformance/` black-box tests and other Go test packages alike.
 - License: GPL v3 (root module). License headers managed via `make addlicense`.
 - `AGENTS.md` is a symlink to this file.
 
